@@ -1,0 +1,42 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        { 
+            "name": "Debug net_listener (via setcap)",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/target/debug/net_listener",
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "cargo: build Debug with SetCap",
+            "console": "externalTerminal" // Показать вывод в отдельном терминале
+        },        
+        {  //start before sudo lldb-server platform --listen "*:1234" --server
+            "name": "Debug as Root (via lldb-server)",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/target/debug/net_listener",
+            "initCommands": [
+                "platform select remote-linux",
+                "platform connect connect://localhost:1234"
+            ],
+            "preLaunchTask": "cargo: build debug"
+        },        
+        {
+            "name": "Debug net_listener (Attach)",
+            "type": "lldb",
+            "request": "attach",
+            "program": "${workspaceFolder}/target/debug/net_listener",
+            "pid": "${command:pickProcess}",
+            "preLaunchTask": "cargo: build Debug with SetCap"
+        },        
+        {
+            "name": "Release net_listener",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/target/release/net_listener",
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "cargo: build Release with SetCap",
+            "console": "externalTerminal"
+        }
+    ]
+}

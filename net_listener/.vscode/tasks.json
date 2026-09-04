@@ -1,0 +1,86 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "cargo: build Debug with SetCap",
+            "dependsOrder": "sequence", // Важно: выполнять строго по порядку
+            "dependsOn": [
+                "cargo: build debug",
+                "rust: SetCap for Debug",
+            ],
+            "problemMatcher": []
+        },
+        {
+            "label": "rust: SetCap for Debug",
+            "type": "shell",
+            "dependsOrder": "sequence", // Важно: выполнять строго по порядку
+            "command": "sudo setcap 'cap_net_raw,cap_net_admin=eip' ${workspaceFolder}/target/debug/${workspaceFolderBasename}"
+        },
+        {
+            "label": "cargo: build Release with SetCap",
+            "dependsOrder": "sequence", // Важно: выполнять строго по порядку
+            "dependsOn": [
+                "cargo: build debug",
+                "rust: SetCap for Release",
+            ],
+            "problemMatcher": []
+        },
+        {
+            "label": "rust: SetCap for Release",
+            "type": "shell",
+            "dependsOrder": "sequence", // Важно: выполнять строго по порядку
+            "command": "sudo setcap 'cap_net_raw,cap_net_admin=eip' ${workspaceFolder}/target/release/${workspaceFolderBasename}"
+        },
+        {
+            "label": "cargo: build debug",
+            "type": "shell",
+            "command": "cargo",
+            "args": ["build"],
+            "dependsOrder": "sequence", // Важно: выполнять строго по порядку
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": ["$rustc"],
+            "detail": "Build in debug mode"
+        },
+        {
+            "label": "cargo: build release",
+            "type": "shell",
+            "command": "cargo",
+            "args": ["build", "--release"],
+            "group": "build",
+            "dependsOrder": "sequence", // Важно: выполнять строго по порядку
+            "problemMatcher": ["$rustc"],
+            "detail": "Build in release mode"
+        },
+        {
+            "label": "cargo: run",
+            "type": "shell",
+            "command": "cargo",
+            "args": ["run"],
+            "group": "build",
+            "dependsOrder": "sequence", // Важно: выполнять строго по порядку
+            "problemMatcher": ["$rustc"],
+            "detail": "Run the project"
+        },
+        {
+            "label": "cargo: test",
+            "type": "shell",
+            "command": "cargo",
+            "args": ["test"],
+            "group": "test",
+            "dependsOrder": "sequence", // Важно: выполнять строго по порядку
+            "problemMatcher": ["$rustc"],
+            "detail": "Run tests"
+        },
+        {
+            "label": "cargo: clean",
+            "type": "shell",
+            "command": "cargo",
+            "args": ["clean"],
+            "problemMatcher": [],
+            "detail": "Clean build artifacts"
+        }
+    ]
+}

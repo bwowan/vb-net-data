@@ -1,0 +1,132 @@
+● Корневая причина: cap.next_packet() — это блокирующий системный вызов внутри tokio async-задачи, без единой точки .await в горячем пути.                                                                      
+                                                                                                                                                                                                                
+  ---                                                                                                                                                                                                           
+  Что происходит                                                                                                                                                                                                
+                                                                                                                                                                                                                
+  // capture.rs — горячий путь НИКОГДА не уступает поток:                                                                                                                                                       
+  while !shutdown_flag.load(...) {                                                                                                                                                                              
+      match cap.next_packet() {   // ← БЛОКИРУЕТ поток ОС (до 3000ms timeout)
+          Ok(packet) => {
+              sender.try_send(cap_data);  // sync, без .await
+          }
+      }
+      // нет .await → tokio-шедулер НИКОГДА не получает управление обратно
+  }
+
+  capture_loop — это async fn, но её тело — синхронный бесконечный цикл. Tokio может переключать задачи только в точках .await. Раз их нет — рабочий поток захвачен навсегда.
+
+  ---
+  Почему parse_loop зависает
+
+  Tokio создаёт пул рабочих потоков, по умолчанию равный числу логических CPU. Возможны два сценария:
+
+  ┌─────────────────────────┬────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │        Ситуация         │                                                                           Результат                                                                            │
+  ├─────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 1 CPU / 1 worker thread │ capture_loop занимает единственный поток. parse_loop никогда не получает планировщик. recv_async().await ждёт вечно.                                           │
+  ├─────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ N CPU, N worker threads │ Один поток занят capture. Остальные доступны для parse. Но try_send может вызываться до того, как recv_async зарегистрировал waker (future не была запрошена). │
+  └─────────────────────────┴────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+
+  Ключевой момент: когда try_send вызывается, а waker ещё не зарегистрирован (future recv_async не была ни разу опрошена), событие «есть данные» теряется. Канал заполняется, новые пакеты дропаются с "buffer
+  full", а parse_loop — если он наконец запускается — застаёт пустой буфер.
+
+  ---
+  Дополнительная проблема: print!("1") вводит в заблуждение
+
+  print! (без ln) использует буферизированный stdout. Символы "1" могут скапливаться в буфере и не отображаться сразу — они не гарантируют, что try_send был вызван в момент отображения.
+
+  ---
+  Решение
+
+  Вынести блокирующий pcap-цикл в spawn_blocking:
+
+  // capture.rs
+  pub async fn capture_loop(device: pcap::Device, sender: Sender<common::CapData>, ...) {
+      tokio::task::spawn_blocking(move || {
+          // блокирующий цикл здесь — в отдельном OS-потоке из blocking pool
+          let mut cap = ...open()...;
+          while !shutdown_flag.load(Ordering::Relaxed) {
+              match cap.next_packet() {
+                  Ok(packet) => { sender.send(cap_data).ok(); } // sync send
+                  ...
+              }
+          }
+      }).await.ok();
+  }
+
+  Либо, как более правильный вариант, использовать pcap::Capture::setnonblock + tokio::io::unix::AsyncFd для полностью асинхронного захвата. Но spawn_blocking — минимальный фикс, который разблокирует шедулер.
+
+
+
+❯ можно ли в main  сразуы вызывать parser::parse_loop() в контексте spawn_blocking ?                                                                                                                            
+                                                                                           
+● Нет. spawn_blocking ожидает синхронное замыкание FnOnce() -> T. Если передать туда async fn, она просто вернёт Future не выполнив её.                                                                         
+                                                                                                                                                                                                                
+  // ЭТО НЕ РАБОТАЕТ — future создаётся, но не выполняется                                                                                                                                                      
+  tokio::task::spawn_blocking(|| {                                                                                                                                                                              
+      parser::parse_loop(own_mac, cap2parse_rx, tx) // просто создаёт Future                                                                                                                                    
+  })                                                                                                                                                                                                            
+                                                                                                                                                                                                                
+  parse_loop — правильный async-код с нормальными await-точками, его не нужно трогать. Проблема только в capture_loop.
+
+  Нужно перенести spawn_blocking внутрь capture_loop вокруг блокирующего вызова cap.next_packet():
+
+  // capture.rs — только это нужно исправить
+  pub async fn capture_loop(...) {
+      // ...инициализация cap...
+
+      // Вынести блокирующий цикл в blocking thread pool
+      tokio::task::spawn_blocking(move || {
+          while !shutdown_flag.load(Ordering::Relaxed) {
+              match cap.next_packet() {
+                  Ok(packet) => {
+                      let cap_data = ...;
+                      match sender.send(cap_data) { // sync send, не try_send
+                          Err(flume::SendError(_)) => break,
+                          Ok(_) => {}
+                      }
+                  }
+                  Err(pcap::Error::TimeoutExpired) => continue,
+                  Err(e) => { eprintln!(...); break; }
+              }
+          }
+      }).await.ok();
+  }
+
+  main.rs при этом не меняется — capture_loop остаётся async fn и вызывается через tokio::spawn как прежде. Внутри себя она сама делегирует блокирующую работу в spawn_blocking.
+
+❯ почему нельяз вызывать всю функцию capture_loop()из  main  в blocking  контексте?                                                                                                                             
+                                                                                   
+● Можно, но только если сделать capture_loop синхронной функцией. Сейчас это async fn, и вызов её в spawn_blocking вернёт Future без выполнения.                                                                
+                                                                                                                                                                                                                
+  Два варианта:                                                                                                                                                                                                 
+                                                                                                                                                                                                                
+  Вариант A — убрать async из capture_loop и вызвать из spawn_blocking в main:                                                                                                                                  
+                                                                                                                                                                                                                
+  // capture.rs                                                                                                                                                                                                 
+  pub fn capture_loop(device: pcap::Device, sender: Sender<common::CapData>, ...) {
+      // без async — обычная sync-функция
+      ...
+      while ... {
+          cap.next_packet() ...
+          sender.send(cap_data) ...  // sync send
+      }
+  }
+
+  // main.rs
+  tokio::task::spawn_blocking(move || {
+      capture::capture_loop(dev, cap2parse_tx, sh);  // ✓ sync fn
+  });
+
+  Вариант B — оставить async fn, завернуть внутренности в spawn_blocking внутри самой функции (как я показал раньше).
+
+  ---
+  Оба варианта рабочие. Вариант A даже чище — capture_loop честно объявляет, что она блокирующая. Вариант B сохраняет async-интерфейс, что полезно если в будущем нужно добавить настоящий async-код в
+  инициализацию или shutdown.
+
+  Ограничение варианта A: cap2parse_tx должен использовать sync send(), а не send_async().
+
+
+

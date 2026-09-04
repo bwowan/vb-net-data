@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//mnt/DevData/Job/NetData/common/**)",
+      "Read(//home/evdkm/.continue/**)"
+    ]
+  }
+}

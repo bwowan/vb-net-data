@@ -1,0 +1,39 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Build-net_listener-setCap",
+            "type": "cargo",
+            "dependsOn": ["build", "setcap"],
+            "args": [
+                "--bin=net_listener",
+                "--package=net_listener"
+            ],
+            "problemMatcher": [
+                "$rustc"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            }
+        }
+        {
+            "label": "setcap",
+            "type": "shell",
+            "command": "sudo setcap cap_net_raw+ep ${workspaceFolder}/target/debug/net_listener",
+            "presentation": {
+                "reveal": "silent",
+                "echo": false
+            }
+        }
+        {
+            "label": "sudo-cargo-run",
+            "type": "shell",
+            "command": "sudo ${workspaceFolder}/target/debug/net_listener",
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "never"
+            }
+        }
+    ]
+}

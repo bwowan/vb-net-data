@@ -1,0 +1,11 @@
+[package]
+name = "net_visualizator"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.41", features = ["full"] }
+bevy = { version = "0.14", default-features = false, features = ["bevy_winit", "bevy_render", "bevy_pbr", "bevy_asset", "x11"] }
+anyhow = "1.0"
+serde_json = "1.0"
+common = { path = "../common" }

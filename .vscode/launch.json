@@ -1,0 +1,95 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of possible attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug executable 'net_listener'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "run",
+                    "--bin=net_listener",
+                    "--package=net_listener"
+                ],
+                "cwd": "${workspaceFolder}"
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "sourceLanguages": ["rust"],
+            "stopOnEntry": false,
+            "console": "debugConsole",
+            "preLaunchTask": "Build-net_listener-setCap"
+        }
+        {
+            "name": "Debug executable 'net_listener' (built binary)",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/target/debug/net_listener",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "sourceLanguages": ["rust"],
+            "stopOnEntry": false,
+            "console": "debugConsole",
+            "preLaunchTask": "Build net_listener"
+        },
+        {
+            "name": "Debug unit tests in library 'common'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--package=common"
+                ],
+                "cwd": "${workspaceFolder}"
+            }
+        },
+        {
+            "name": "Debug unit tests in executable 'net_listener'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--bin=net_listener",
+                    "--package=net_listener"
+                ],
+                "cwd": "${workspaceFolder}"
+            }
+        },
+        {
+            "name": "Debug executable 'net_visualizator'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "run",
+                    "--bin=net_visualizator",
+                    "--package=net_visualizator"
+                ],
+                "cwd": "${workspaceFolder}"
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "sourceLanguages": ["rust"],
+            "stopOnEntry": false,
+            "console": "debugConsole"
+        },
+        {
+            "name": "Debug unit tests in executable 'net_visualizator'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--bin=net_visualizator",
+                    "--package=net_visualizator"
+                ],
+                "cwd": "${workspaceFolder}"
+            }
+        }
+    ]
+}
