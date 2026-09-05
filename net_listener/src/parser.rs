@@ -31,27 +31,27 @@ pub async fn parse_loop(own_mac : common::MacAddr6,
         //println!(" Receiver --> disConnected_{} empty_{} full_{}, len:{}, cap:{}, s_cnt:{}, r_cnt:{}",
         //        receiver.is_disconnected(), receiver.is_empty(), receiver.is_full(), 
         //         receiver.len(), receiver.capacity().unwrap_or(9999), receiver.sender_count(), receiver.receiver_count());
-        let cap_data = receiver.recv_async().await;
-        if cap_data.is_err() {
-            println!("PARSER: error read from receiver");
-            break;
-        }
-        else {
-            let cap_data = cap_data.unwrap();
-            match parse_ethernet_packet(cap_data, own_mac) {
-                Ok(_net_data) => {
-                    //println!("[parser] {}", net_data);
-                    /*match sender.send_async(net_data).await {
-                        Ok(_) => {},
-                        Err(e) => {
-                            println!("[parser] Downstream receiver gone, stopping {:?}.", e);
-                            break;
-                        }
-                    }*/
-                }
-                Err(err) => {
-                    println!("[parser] {}", err);
-                    continue;
+        match receiver.recv_async().await {
+            Err(e) => {
+                println!("PARSER: error read from receiver - {:?}", e);
+                break;
+            }
+            Ok(data) => {
+                match parse_ethernet_packet(data, own_mac) {
+                    Ok(_net_data) => {
+                        //println!("[parser] {}", net_data);
+                        /*match sender.send_async(net_data).await {
+                            Ok(_) => {},
+                            Err(e) => {
+                                println!("[parser] Downstream receiver gone, stopping {:?}.", e);
+                                break;
+                            }
+                        }*/
+                    }
+                    Err(e) => {
+                        println!("[parser] {:?}", e);
+                        continue;
+                    }
                 }
             }
         }
@@ -82,14 +82,16 @@ fn find_eth_type(protocol: pnet_packet::ethernet::EtherType) -> common::EthType 
 }
 
 fn get_direction(src: &common::MacAddr6, dst: &common::MacAddr6, own_mac: &common::MacAddr6) -> common::EDirection {
-    if src == own_mac {
+    if dst.0[0] & 1 == 1 {
+        if *dst == common::BROADCAST_ADDRESS6 {
+            common::EDirection::Broadcast
+        } else {
+            common::EDirection::Multicast
+        }
+    } else if src == own_mac {
         common::EDirection::Outgoing
     } else if dst == own_mac {
         common::EDirection::Incoming
-    } else if *dst == common::BROADCAST_ADDRESS6 || *dst == common::CISCO_BROADCAST_ADDRESS6 {
-        common::EDirection::Broadcast
-    } else if common::LLDP_BROADCASTS.iter().any(|&p| p == *dst) {
-        common::EDirection::Broadcast
     } else {
         common::EDirection::Unknown
     }
@@ -98,25 +100,25 @@ fn get_direction(src: &common::MacAddr6, dst: &common::MacAddr6, own_mac: &commo
 
 // ── Ethernet ────────────────────────────────────────────────────────────────
 fn parse_ethernet_packet(data: common::CapData, own_mac: common::MacAddr6) -> Result<common::NetData, common::ParseError> {
-    let eth = etherparse::Ethernet2Header::from_slice(&data.data);
-    if eth.is_err() {
-        return Err(common::ParseError::Eth_Broken { len: data.data.len() });
-    }
+    let (eth_header, eth_payload) = etherparse::Ethernet2Header::from_slice(&data.data).map_err(|e| {
+            println!("{:?}", e);
+            common::ParseError::Eth_Broken { len: data.data.len() }
+        })?;
     
-    let (eth_header, eth_payload) = eth.unwrap();
-    let src = common::MacAddr6::new(eth_header.source);
-    let dst = common::MacAddr6::new(eth_header.destination);
+    let (src, dst) = (common::MacAddr6::new(eth_header.source), common::MacAddr6::new(eth_header.destination));
     let dir = get_direction(&src, &dst, &own_mac);
     let prot = find_eth_type(pnet_packet::ethernet::EtherType::new(eth_header.ether_type.0));
 
     let result: Result<common::NetPayload, common::ParseError> = match eth_header.ether_type.0 {
-                0x0600..=0xFFFF =>  // 1536 - type is type
-                                    parse_RegularEthernet(eth_payload, prot),
-                0x05DC..0x0600  =>   // 1501–1535 — зарезервировано / invalid по стандарту, Почти все стеки отбрасывают такие кадры
-                                    Err(common::ParseError::Unsupported_Eth { id: eth_header.ether_type.0 }),
-                0x0008..0x05DC  =>   //LLC + SNAP headers → ожидаем IEEE 802.3 + LLC
-                                    parse_LLC_SNAP(eth_payload, eth_header.ether_type.0), 
-                0x0000..0x0008  =>  Err(common::ParseError::Unsupported_Eth { id: eth_header.ether_type.0 }), //to short
+                0x0000..=0x0007 | 0x05DC..=0x05FF => // Зарезервированные/недопустимые диапазоны
+                    Err(common::ParseError::Unsupported_Eth { id: eth_header.ether_type.0 }),
+                
+                0x0008..=0x05DB  =>                  //LLC + SNAP headers → ожидаем IEEE 802.3 + LLC
+                    parse_LLC_SNAP(eth_payload, eth_header.ether_type.0),
+                
+                0x0600..=0xFFFF =>                   // 1536 - type is type
+                    parse_RegularEthernet(eth_payload, prot),
+
     };
     match result {
         Ok(r) => {

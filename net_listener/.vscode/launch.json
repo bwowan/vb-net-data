@@ -10,7 +10,7 @@
             "preLaunchTask": "cargo: build Debug with SetCap",
             "console": "externalTerminal" // Показать вывод в отдельном терминале
         },        
-        {  //start before sudo lldb-server platform --listen "*:1234" --server
+        {  //start before sudo lldb-server platform --listen "*:1234" --server (apt install lldb)
             "name": "Debug as Root (via lldb-server)",
             "type": "lldb",
             "request": "launch",

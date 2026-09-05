@@ -52,6 +52,7 @@ impl fmt::Display for EDirection {
             EDirection::Incoming  => write!(f, "---->"),
             EDirection::Outgoing  => write!(f, "<----"),
             EDirection::Broadcast => write!(f, "<<->>"),
+            EDirection::Multicast => write!(f, "<-->>"),
             EDirection::Unknown   => write!(f, "?????"),
         }
     }

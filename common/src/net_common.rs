@@ -10,11 +10,18 @@ pub struct CapData {
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
 pub struct MacAddr6(pub [u8; 6]);
 
+//01:80:C2:00:00:00 до 01:80:C2:00:00:2F зарезервированы для протоколов управления мостами (MAC Bridges)
+//и сетевых протоколов контроля (Spanning Tree, 802.3ad LACP и др.)
 pub const CISCO_BROADCAST_ADDRESS6: MacAddr6 = MacAddr6([0x01, 0x00, 0x0C, 0xCC, 0xCC, 0xCC]);
 pub const BROADCAST_ADDRESS6      : MacAddr6 = MacAddr6([0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
-pub const LLDP_BROADCASTS         : [MacAddr6; 3] = [MacAddr6([0x01, 0x80, 0xC2, 0x00, 0x00, 0x0E]), 
-                                                     MacAddr6([0x01, 0x80, 0xC2, 0x00, 0x00, 0x03]),
-                                                     MacAddr6([0x01, 0x80, 0xC2, 0x00, 0x00, 0x00])];
+
+//LLDP (Link Layer Discovery Protocol, IEEE 802.1AB)
+pub const LLDP_BROADCAST_ADDRESS6 : MacAddr6 = MacAddr6([0x01, 0x80, 0xC2, 0x00, 0x00, 0x0E]);
+
+//Адреса в диапазоне от 01:80:C2:00:00:00 до 01:80:C2:00:00:2F зарезервированы для протоколов управления мостами
+//(MAC Bridges) и сетевых протоколов контроля (Spanning Tree, 802.3ad LACP и др.).
+pub const BRIDGE_BROADCAST_BASE_ADDRESS6: MacAddr6 = MacAddr6([0x01, 0x80, 0xC2, 0x00, 0x00, 0x00]);
+
 //pub const STP_BPDU_ADDRESS6       : MacAddr6 = MacAddr6([0x01, 0x80, 0xC2, 0x00, 0x00, 0x00]);
 //pub const CDP_ADDRESS6            : MacAddr6 = MacAddr6([0x01, 0x00, 0x0C, 0xCC, 0xCC, 0xCC]);
 //pub const VTP_ADDRESS6            : MacAddr6 = MacAddr6([0x01, 0x00, 0x0C, 0xCC, 0xCC, 0xCC]);
@@ -244,6 +251,7 @@ pub enum EDirection {
     Incoming,
     Outgoing,
     Broadcast,
+    Multicast,
 }
 
 #[derive(Clone, Copy)]

@@ -1,4 +1,5 @@
 use crate::net_common::*;
+use std::fmt::Debug;
 
 impl TrafficStats {
     pub fn new() -> Self { Self::default() }
@@ -90,5 +91,31 @@ impl Default for IpData {
 impl Default for NetPayload {
     fn default() -> Self {
         NetPayload::Err(ParseError::default())
+    }
+}
+
+impl Debug for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let variant_name = match self {
+            ParseError::Unknown_Error                   => "Unknown_Error",
+            ParseError::Unsupported_Eth { .. }          => "Unsupported_Eth",
+            ParseError::Unsupported_Eth_SNAP_OUI { .. } => "Unsupported_Eth_SNAP_OUI",
+            ParseError::Unsupported_L4 { .. }           => "Unsupported_L4",
+            ParseError::Eth_Broken { .. }               => "Eth_Broken",
+            ParseError::Ip4_Broken { .. }               => "Ip4_Broken",
+            ParseError::Ip6_Broken { .. }               => "Ip6_Broken",
+            ParseError::Tcp_Broken { .. }               => "Tcp_Broken",
+            ParseError::Udp_Broken { .. }               => "Udp_Broken",
+            ParseError::Icmp4_Broken { .. }             => "Icmp4_Broken",
+            ParseError::Icmp6_Broken { .. }             => "Icmp6_Broken",
+            ParseError::Ip4_Fragment { .. }             => "Ip4_Fragment",
+            ParseError::Arp_Broken { .. }               => "Arp_Broken",
+            ParseError::Mpls_Broken { .. }              => "Mpls_Broken",
+            ParseError::Lldp_Broken { .. }              => "Lldp_Broken",
+            ParseError::Ectp { .. }                     => "Ectp",
+            ParseError::DEC_Broken { .. }               => "DEC_Broken",
+            ParseError::Cisco_Broken { .. }             => "Cisco_Broken",
+        };
+        write!(f, "{}", variant_name)
     }
 }
