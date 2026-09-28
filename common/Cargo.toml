@@ -12,3 +12,4 @@ path = "src/mod.rs"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 macaddr = "1.0"
+heapless = "0.9.3"

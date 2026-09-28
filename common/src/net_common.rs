@@ -7,20 +7,21 @@ pub struct CapData {
     pub data    : Vec<u8>,
 }
 
+pub const MAC_ADDRESS_LEN6:usize = 6;
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
-pub struct MacAddr6(pub [u8; 6]);
+pub struct MacAddr6(pub [u8; MAC_ADDRESS_LEN6]);
 
-//01:80:C2:00:00:00 до 01:80:C2:00:00:2F зарезервированы для протоколов управления мостами (MAC Bridges)
-//и сетевых протоколов контроля (Spanning Tree, 802.3ad LACP и др.)
-pub const CISCO_BROADCAST_ADDRESS6: MacAddr6 = MacAddr6([0x01, 0x00, 0x0C, 0xCC, 0xCC, 0xCC]);
-pub const BROADCAST_ADDRESS6      : MacAddr6 = MacAddr6([0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+//broadcats templates
+pub const BROADCAST_ADDRESS6             : MacAddr6 = MacAddr6([0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+pub const CISCO_BROADCAST_ADDRESS6       : MacAddr6 = MacAddr6([0x01, 0x00, 0x0C, 0xCC, 0xCC, 0xCC]);
 
 //LLDP (Link Layer Discovery Protocol, IEEE 802.1AB)
-pub const LLDP_BROADCAST_ADDRESS6 : MacAddr6 = MacAddr6([0x01, 0x80, 0xC2, 0x00, 0x00, 0x0E]);
+pub const LLDP_BROADCAST_ADDRESS6        : MacAddr6 = MacAddr6([0x01, 0x80, 0xC2, 0x00, 0x00, 0x0E]);
 
 //Адреса в диапазоне от 01:80:C2:00:00:00 до 01:80:C2:00:00:2F зарезервированы для протоколов управления мостами
 //(MAC Bridges) и сетевых протоколов контроля (Spanning Tree, 802.3ad LACP и др.).
-pub const BRIDGE_BROADCAST_BASE_ADDRESS6: MacAddr6 = MacAddr6([0x01, 0x80, 0xC2, 0x00, 0x00, 0x00]);
+pub const BRIDGE_BROADCAST_START_ADDRESS6: MacAddr6 = MacAddr6([0x01, 0x80, 0xC2, 0x00, 0x00, 0x00]);
+pub const BRIDGE_BROADCAST_END_ADDRESS6  : MacAddr6 = MacAddr6([0x01, 0x80, 0xC2, 0x00, 0x00, 0x2F]);
 
 //pub const STP_BPDU_ADDRESS6       : MacAddr6 = MacAddr6([0x01, 0x80, 0xC2, 0x00, 0x00, 0x00]);
 //pub const CDP_ADDRESS6            : MacAddr6 = MacAddr6([0x01, 0x00, 0x0C, 0xCC, 0xCC, 0xCC]);
@@ -36,7 +37,7 @@ pub struct MacAddr8(pub [u8; 8]);
 pub use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, Debug)]
 pub struct TrafficStats {
     pub rx_packets: u64, // Количество входящих пакетов
     pub tx_packets: u64, // Количество исходящих пакетов
@@ -66,8 +67,10 @@ pub enum EthType {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ArpOp {
     Unknown(u16),
-    Request,   // 1
-    Reply,     // 2
+    Request,     // 1  RFC 826
+    Reply,       // 2
+    RarpRequest, // 3  RFC 903
+    RarpReply,   // 4
 }
 
 #[derive(Clone, Copy)]
@@ -150,13 +153,23 @@ pub struct CISCO_CDP_HEADER {
 }
 
 //длина может быть любой, но мы упрощаем, берём только начальный байты
-pub const LLDP_TLV_MAX_LEN: usize = 32;
+pub const LLDP_TLV_MAX_LEN: usize = 64;
 #[repr(C, packed)]
-#[derive(Default, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct TLV_DATA {
     pub tlv_len : u16,
     pub tlv_type: u16,
     pub tlv_data: [u8; LLDP_TLV_MAX_LEN],
+}
+
+impl Default for TLV_DATA {
+    fn default() -> Self {
+        Self {
+            tlv_len: 0,
+            tlv_type: 0,
+            tlv_data: [0u8; LLDP_TLV_MAX_LEN],
+        }
+    }
 }
 
 pub const CISCO_CDP_MAX_ADDRESS_LEN: usize = 16;
@@ -166,27 +179,19 @@ pub struct CISCO_CDP_ADDRESS {
     pub prot_type: u8,
     pub prot_len : u8,
     pub prot     : u16, //reserved two bytes
-    pub addr_len : u8,
+    pub addr_len : u16,
     pub addr     : [u8; CISCO_CDP_MAX_ADDRESS_LEN], // Max IPv6 address length
 }
 
-#[derive(Default, Copy, Clone)]
-pub struct CISCO_CDP_ADDRESSES {
-    pub count    : u8,
-    pub addresses: [CISCO_CDP_ADDRESS; CISCO_CDP_MAX_ADDRESSES], // Max 4 addresses
-}
-
-#[derive(Default, Copy, Clone)]
+pub const CISCO_CDP_MAX_TLVS: usize = 32;
+#[derive(Default, Clone)]
 pub struct CDP_CISCO_DATA {
     pub Header         : CISCO_CDP_HEADER,
-    pub DeviceId       : TLV_DATA,              // Type 0x0001
-    pub Address        : CISCO_CDP_ADDRESSES,   // Type 0x0002
-    pub PortId         : TLV_DATA,              // Type 0x0003
+    pub addresses      : heapless::Vec<CISCO_CDP_ADDRESS, CISCO_CDP_MAX_ADDRESSES>,   // Type 0x0002
     pub Capabilities   : u32,                   // Type 0x0004
-    pub SoftwareVersion: TLV_DATA,              // Type 0x0005
-    pub Platform       : TLV_DATA,              // Type 0x0006
+    pub tlvs           : heapless::Vec<TLV_DATA, CISCO_CDP_MAX_TLVS>,
 }
-#[derive(Copy, Clone)]
+#[derive(Clone)]
 pub enum CiscoData {
     CDP(CDP_CISCO_DATA), // 0x2000	CDP    (Discovery)	      Поиск соседей и обмен информацией о железе.
     CGMP,                // 0x2001	CGMP   (Group Mgmt)	      Управление Multicast-группами (устаревший).
@@ -198,21 +203,31 @@ pub enum CiscoData {
 }
 
 
+pub const LLDP_MAX_TLVS: usize = 16;
+pub const LLDP_MAX_MGMT_ADDRS: usize = 4;
 
+/// Management Address (TLV type 8, IEEE 802.1AB).
+/// Value: addr_str_len(1) + family(1) + addr[N] + if_subtype(1) + if_number(4) + oid_len(1) [+ oid]
 #[derive(Default, Clone, Copy)]
-pub struct LLDP_Data {
-    pub Chassis_ID       : TLV_DATA, //1 Уникальный ID коммутатора (обычно MAC)
-    pub Port_ID          : TLV_DATA, //2 Идентификатор порта (например, "GigabitEthernet0/1")
-    pub TTL              : u16,      //3 Время жизни информации LLDP в секундах
-    pub Port_DESC        : TLV_DATA, //4 Описание порта (например, "Ethernet port on Gi0/1")
-    pub Sys_NAME         : TLV_DATA, //5 Имя системы (например, "MySwitch")
-    pub Sys_DESC         : TLV_DATA, //6 Описание системы (например, "Cisco IOS Software...")
-    pub Sys_CAP_supported: u16, //7 Поддерживаемые возможности системы (например, "Bridge, Router")
-    pub Sys_CAP_enabled  : u16, //7 Поддерживаемые возможности системы (например, "Bridge, Router")
-    pub Management_Addr  : TLV_DATA, //8 Адрес управления (например, IP-адрес устройства)
+pub struct LLDP_MgmtAddr {
+    pub family    : u8,   // IANA Address Family: 1=IPv4, 2=IPv6
+    pub addr_len  : u8,   // длина адреса (без family)
+    pub addr      : [u8; 16],
+    pub if_subtype: u8,   // 1=unknown, 2=ifIndex, 3=system port number
+    pub if_number : u32,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Default, Clone)]
+pub struct LLDP_Data {
+    pub TTL              : u16, //3 Время жизни информации LLDP в секундах
+    pub Sys_CAP_supported: u16, //7 Поддерживаемые возможности системы
+    pub Sys_CAP_enabled  : u16, //7 Активные возможности системы
+    pub mgmt_addrs       : heapless::Vec<LLDP_MgmtAddr, LLDP_MAX_MGMT_ADDRS>, //8
+    pub tlvs             : heapless::Vec<TLV_DATA, LLDP_MAX_TLVS>,
+}
+
+
+#[derive(Clone)]
 pub enum NetPayload {
     Err (ParseError),
     Ip  (IpData),
@@ -245,7 +260,7 @@ pub struct EthData {
     pub prot: EthType,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum EDirection {
     Unknown,
     Incoming,
@@ -265,7 +280,7 @@ pub struct IpData {
 }
 
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct NetData {
     pub eth    : EthData,
     pub payload: NetPayload,
@@ -277,17 +292,21 @@ pub struct NetData {
 pub enum ParseError {
     Unknown_Error,
     Unsupported_Eth          { id : u16   },                           // Неизвестный или неподдерживаемый EtherType.
+    LLC_SNAP_TooShort_Broken { id : u16, len: usize },                 // должен быть длинее 8 байт
+    LLC_SNAP_Header_Broken   { id : u16, header:[u8;8] },              // нераспознанный заголовок ()
     Unsupported_Eth_SNAP_OUI { oui:[u8;3], prot_id:u16 },
     Unsupported_L4           { id : u8    },                           // Протокол L4 не поддерживается (не TCP/UDP/ICMP).
     Eth_Broken               { len: usize },                           // Кадр слишком короткий для Ethernet (меньше 14 байт).                         
     Ip4_Broken               { len: usize },                           // IPv4-заголовок не помещается в payload (меньше 20 байт).
-    Ip6_Broken               { len: usize },                           // IPv6-заголовок не помещается в payload (меньше 40 байт).
+    Ip6_Broken               { len: usize },                           // IPv6-заголовок или extension header не помещается в payload.
     Tcp_Broken               { len: usize, src: IpAddr, dst: IpAddr }, // Payload слишком короткий для TCP (меньше 20 байт) или заголовок невалиден.
     Udp_Broken               { len: usize, src: IpAddr, dst: IpAddr }, // Payload слишком короткий для UDP (меньше 8 байт) или заголовок невалиден.
     Icmp4_Broken             { len: usize, src: IpAddr, dst: IpAddr }, // Payload слишком короткий для ICMP (меньше 4 байт) или заголовок невалиден.
     Icmp6_Broken             { len: usize, src: IpAddr, dst: IpAddr }, // Payload слишком короткий для ICMPv6 или заголовок невалиден.
     Ip4_Fragment             {             src: IpAddr, dst: IpAddr }, // IPv4-фрагмент (не первый); полный L4-заголовок может быть в другом фрагменте.
+    Ip6_Fragment             {             src: IpAddr, dst: IpAddr }, // IPv6-фрагмент (не первый); полный L4-заголовок может быть в другом фрагменте.
     Arp_Broken               { len: usize },                           // ARP payload слишком короткий (нужно минимум 28 байт).
+    Arp_Unsupported          { hw_type: u16, proto_type: u16, hw_len: u8, proto_len: u8 }, // не Ethernet+IPv4 ARP/RARP
     Mpls_Broken              { len: usize },                           // MPLS payload слишком короткий (нужно минимум 4 байта).
     Lldp_Broken              { len: usize },                           // LLDP payload слишком короткий (нужно минимум 4 байта).
     Ectp                     { len: usize },                           // 0x9003 Ethernet Configuration Test Protocol (ECTP) \[IEEE 802.3\]

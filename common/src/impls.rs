@@ -96,9 +96,18 @@ impl Default for NetPayload {
 
 impl Debug for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let ParseError::Arp_Unsupported { hw_type, proto_type, hw_len, proto_len } = self {
+            return write!(
+                f,
+                "Arp_Unsupported {{ hw_type: 0x{:04x}, proto_type: 0x{:04x}, hw_len: {}, proto_len: {} }}",
+                hw_type, proto_type, hw_len, proto_len
+            );
+        }
         let variant_name = match self {
             ParseError::Unknown_Error                   => "Unknown_Error",
             ParseError::Unsupported_Eth { .. }          => "Unsupported_Eth",
+            ParseError::LLC_SNAP_TooShort_Broken { .. } => "LLC_SNAP_TooShort",
+            ParseError::LLC_SNAP_Header_Broken   { .. } => "LLC_SNAP_Header_Broken",
             ParseError::Unsupported_Eth_SNAP_OUI { .. } => "Unsupported_Eth_SNAP_OUI",
             ParseError::Unsupported_L4 { .. }           => "Unsupported_L4",
             ParseError::Eth_Broken { .. }               => "Eth_Broken",
@@ -109,7 +118,9 @@ impl Debug for ParseError {
             ParseError::Icmp4_Broken { .. }             => "Icmp4_Broken",
             ParseError::Icmp6_Broken { .. }             => "Icmp6_Broken",
             ParseError::Ip4_Fragment { .. }             => "Ip4_Fragment",
+            ParseError::Ip6_Fragment { .. }             => "Ip6_Fragment",
             ParseError::Arp_Broken { .. }               => "Arp_Broken",
+            ParseError::Arp_Unsupported { .. }          => "Arp_Unsupported",
             ParseError::Mpls_Broken { .. }              => "Mpls_Broken",
             ParseError::Lldp_Broken { .. }              => "Lldp_Broken",
             ParseError::Ectp { .. }                     => "Ectp",

@@ -1,6 +1,9 @@
 #![allow(non_snake_case)]
+use std::cmp::min;
 use std::fmt;
-use crate::net_common::*;
+use core::fmt::Write;
+use crate::{EDirection::Multicast, net_common::*};
+use heapless;
 
 impl fmt::Display for TrafficStats {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -45,16 +48,20 @@ impl fmt::Display for IpType {
     }
 }
 
+fn dir_2_str(d: EDirection) -> &'static str {
+    match d {
+        EDirection::Incoming  => "-->",
+        EDirection::Outgoing  => "<--",
+        EDirection::Broadcast => ">>>",
+        EDirection::Multicast => "->>",
+        EDirection::Unknown   => "???",
+    }
+}
+
 
 impl fmt::Display for EDirection {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            EDirection::Incoming  => write!(f, "---->"),
-            EDirection::Outgoing  => write!(f, "<----"),
-            EDirection::Broadcast => write!(f, "<<->>"),
-            EDirection::Multicast => write!(f, "<-->>"),
-            EDirection::Unknown   => write!(f, "?????"),
-        }
+        write!(f, "{}", dir_2_str(*self))
     }
 }
     
@@ -74,13 +81,30 @@ impl fmt::Display for MacAddr8 {
 
 impl fmt::Display for EthData {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s  = match self.dst {
-            CISCO_BROADCAST_ADDRESS6 => "(brdcst_cisco)",
-            BROADCAST_ADDRESS6       => "(brdcst_all)",
-            _                        => "",
+        let s_dir = if self.dir == Multicast {
+            let last_section = self.dst.0[MAC_ADDRESS_LEN6 - 1];
+            if last_section == LLDP_BROADCAST_ADDRESS6.0[MAC_ADDRESS_LEN6 - 1] {
+                "LLDP BROADCAST"
+            } else if last_section >= BRIDGE_BROADCAST_START_ADDRESS6.0[MAC_ADDRESS_LEN6 - 1] &&
+                      last_section <= BRIDGE_BROADCAST_END_ADDRESS6.0[MAC_ADDRESS_LEN6 - 1] {
+                "BRIDGE BROADCAST"
+            } else if self.dst == CISCO_BROADCAST_ADDRESS6 {
+                "CISCO BROADCAST"
+            } else {
+                "Multicast"
+            }
+        } else {
+            dir_2_str(self.dir)
         };
-        write!(f, "Eth[{}:{}{}{} {}]", 
-               self.prot, self.src, self.dir,s,  self.dst,
+
+        let mut s_prot: heapless::String<32> = heapless::String::new();
+        if self.prot == EthType::Unsupported {
+            write!(s_prot, "len={}", self.prot as u16)?;
+        } else {
+            write!(s_prot, "{}", self.prot)?;
+        }
+        write!(f, "Eth[{}, {}-{}{}-{}]", 
+               s_prot, self.src, self.dir, s_dir,  self.dst,
         )
     }
 }
@@ -89,8 +113,10 @@ impl fmt::Display for EthData {
 impl fmt::Display for ArpOp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ArpOp::Request => write!(f, "Request"),
-            ArpOp::Reply   => write!(f, "Reply"),
+            ArpOp::Request     => write!(f, "Request"),
+            ArpOp::Reply       => write!(f, "Reply"),
+            ArpOp::RarpRequest => write!(f, "RARP Request"),
+            ArpOp::RarpReply   => write!(f, "RARP Reply"),
             ArpOp::Unknown(id) => write!(f, "Unknown({})", id),
         }
     }
@@ -99,7 +125,12 @@ impl fmt::Display for ArpOp {
 
 impl fmt::Display for ArpData {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "ArpData {}, sender:{}/{}, target:{}/{}",
+        let kind = match self.op {
+            ArpOp::RarpRequest | ArpOp::RarpReply => "RarpData",
+            _ => "ArpData",
+        };
+        write!(f, "{} {}, sender:{}/{}, target:{}/{}",
+            kind,
             self.op,
             self.sender_mac, self.sender_ip,
             self.target_mac, self.target_ip)
@@ -168,21 +199,6 @@ impl fmt::Display for CISCO_CDP_ADDRESS {
     }
 }
 
-impl fmt::Display for CISCO_CDP_ADDRESSES {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.count > 0 {
-            for i in 0..self.count as usize {
-                if let Err(e) = write!(f, "\t[{}]\n", self.addresses[i]) {
-                    return Err(e);
-                }
-            }
-            Ok(())
-        } else {
-            write!(f, "(no addresses)")
-        }
-    }
-}
-
 impl fmt::Display for TLV_DATA {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Берем срез данных реальной длины
@@ -224,15 +240,48 @@ fn CDP_CISCO_DATA_2_Str(cap:u32) -> String {
 
 impl fmt::Display for CDP_CISCO_DATA {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "CDP_CISCO_DATA[ver:{} ttl:{}sec checksum:{:04X}\n\t {} {} {} {} {}; Addr:{}]",
+        write!(f, "CDP_CISCO_DATA[ver:{} ttl:{}sec checksum:{:04X}\n\t {}",
                self.Header.ver as u8, self.Header.ttl as u8, self.Header.chksm as u16,
-               CDP_CISCO_DATA_2_Str(self.Capabilities),
-               TLV_DATA_2_str(&self.DeviceId       , ""     ),
-               TLV_DATA_2_str(&self.PortId         , "; PortId:"  ), 
-               TLV_DATA_2_str(&self.SoftwareVersion, "; SwVer:"   ),
-               TLV_DATA_2_str(&self.Platform       , "; Platform:"),
-               self.Address,
-        )
+               CDP_CISCO_DATA_2_Str(self.Capabilities)
+        )?;
+
+        for tlv in &self.tlvs {
+            match tlv.tlv_type {
+                0x000a if tlv.tlv_len >= 2 => {
+                    let vlan = u16::from_be_bytes([tlv.tlv_data[0], tlv.tlv_data[1]]);
+                    write!(f, "; NativeVLAN:{}", vlan)?;
+                }
+                0x000b if tlv.tlv_len >= 1 => {
+                    match tlv.tlv_data[0] {
+                        0x01 => write!(f, "; Duplex:1(half)")?,
+                        0x02 => write!(f, "; Duplex:2(full)")?,
+                        other => write!(f, "; Duplex:{}", other)?,
+                    }
+                }
+                _ => {
+                    let prefix = match tlv.tlv_type {
+                        0x0001 => " DevID:",
+                        0x0003 => "; PortId:",
+                        0x0005 => "; SwVer:",
+                        0x0006 => "; Platform:",
+                        0x000a => "; NativeVLAN:",
+                        0x000b => "; Duplex:",
+                        _ => "; UnknownTLV:",
+                    };
+                    write!(f, "{}", TLV_DATA_2_str(tlv, prefix))?;
+                }
+            }
+        }
+
+        write!(f, "\n\t Addresses:")?;
+        if !self.addresses.is_empty() {
+            for i in 0..self.addresses.len() {
+                write!(f, "\n\t  [{}] {}", i, self.addresses[i])?;
+            }
+        } else {
+            write!(f, " (none)")?;
+        }
+        write!(f, "]")
     }
 }
 
@@ -248,14 +297,14 @@ impl fmt::Display for CiscoData {
 impl fmt::Display for NetPayload {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            NetPayload::Ip  (data)          => write!(f, "{}", data),
-            NetPayload::Arp (data)          => write!(f, "{}", data),
-            NetPayload::Mpls(data)          => write!(f, "{}", data),
-            NetPayload::Lldp(data)          => write!(f, "{}", data),
-            NetPayload::Ectp(data)          => write!(f, "{}", data),
-            NetPayload::DEC(data)           => write!(f, "{}", data),
-            NetPayload::Cisco(data)         => write!(f, "{}", data),
-            NetPayload::Err (data)          => write!(f, "{}", data),
+            NetPayload::Ip   (data)         => write!(f, "{}", data),
+            NetPayload::Arp  (data)        => write!(f, "{}", data),
+            NetPayload::Mpls (data)       => write!(f, "{}", data),
+            NetPayload::Lldp (data)      => write!(f, "{}", data),
+            NetPayload::Ectp (data)   => write!(f, "{}", data),
+            NetPayload::DEC  (data)  => write!(f, "{}", data),
+            NetPayload::Cisco(data)      => write!(f, "{}", data),
+            NetPayload::Err  (data)     => write!(f, "{}", data),
         }
     }
 }
@@ -285,14 +334,16 @@ fn Cisco_Broken_String(sub_type: &u16) -> &'static str {
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ParseError::Unknown_Error                    => write!(f, "unknown error"),
-            ParseError::Unsupported_Eth { id    }  => write!(f, "unsupported EtherType: 0x{:04x}", id),
-            ParseError::Unsupported_Eth_SNAP_OUI {oui, prot_id} => write!(f, "unsupported SNAP OUI:[{:02x}:{:02x}:{:02x}] Protocol ID:0x{:04x}", oui[0], oui[1], oui[2], prot_id),
-            ParseError::Unsupported_L4  { id     }  => write!(f, "unsupported L4 protocol: {}", id),
-            ParseError::Eth_Broken      { len }  => write!(f, "Ethernet frame too short: {} bytes", len),
-            ParseError::Ip4_Broken      { len }  => write!(f, "IPv4 payload too short: {} bytes (need at least 20)", len),
-            ParseError::Ip6_Broken      { len }  => write!(f, "IPv6 payload too short: {} bytes (need at least 40)", len),
-            ParseError::Tcp_Broken      { len, src, dst } => write!(
+            ParseError::Unknown_Error                                            => write!(f, "unknown error"),
+            ParseError::Unsupported_Eth          { id    }                 => write!(f, "unsupported EtherType: 0x{:04x}", id),
+            ParseError::LLC_SNAP_TooShort_Broken { id, len }       => write!(f, "LLC/SNAP header({:04x}) too short: {} bytes (need at least 8)", id, len),
+            ParseError::LLC_SNAP_Header_Broken   { id, header }  => write!(f, "invalid LLC/SNAP header({:04x}): [{}]", id, header.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" ")),
+            ParseError::Unsupported_Eth_SNAP_OUI { oui, prot_id} => write!(f, "unsupported SNAP OUI:[{:02x}:{:02x}:{:02x}] Protocol ID:0x{:04x}", oui[0], oui[1], oui[2], prot_id),
+            ParseError::Unsupported_L4           { id     }                 => write!(f, "unsupported L4 protocol: {:04x}", id),
+            ParseError::Eth_Broken               { len }                 => write!(f, "Ethernet frame too short: {} bytes", len),
+            ParseError::Ip4_Broken               { len }                 => write!(f, "IPv4 payload too short: {} bytes (need at least 20)", len),
+            ParseError::Ip6_Broken               { len }                 => write!(f, "IPv6 payload too short: {} bytes (need at least 40)", len),
+            ParseError::Tcp_Broken               { len, src, dst } => write!(
                 f, "TCP payload too short or invalid: {} bytes (src={}, dst={})",   len, src, dst
             ),
             ParseError::Udp_Broken   { len, src, dst } => write!(
@@ -307,7 +358,15 @@ impl fmt::Display for ParseError {
             ParseError::Ip4_Fragment { src, dst } => {
                 write!(f, "IPv4 fragment (non-first), L4 unknown (src={}, dst={})", src, dst)
             }
+            ParseError::Ip6_Fragment { src, dst } => {
+                write!(f, "IPv6 fragment (non-first), L4 unknown (src={}, dst={})", src, dst)
+            }
             ParseError::Arp_Broken       { len } => write!(f, "ARP payload too short: {} bytes (need at least 28)", len),
+            ParseError::Arp_Unsupported  { hw_type, proto_type, hw_len, proto_len } => write!(
+                f,
+                "unsupported ARP/RARP: hw_type=0x{:04x}, proto_type=0x{:04x}, hw_len={}, proto_len={} (need Ethernet+IPv4: 1/0x0800, 6/4)",
+                hw_type, proto_type, hw_len, proto_len
+            ),
             ParseError::Mpls_Broken      { len } => write!(f, "MPLS payload too short: {} bytes (need at least 4)",  len),
             ParseError::Lldp_Broken      { len } => write!(f, "LLDP payload too short: {} bytes (need at least 4)",  len),
             ParseError::Ectp            { len } => write!(f, "ECTP payload too short: {} bytes (need at least 4)", len),
@@ -317,18 +376,93 @@ impl fmt::Display for ParseError {
     }
 }
 
+fn LLDP_MgmtAddr_2_str(m: &LLDP_MgmtAddr) -> String {
+    let if_name = match m.if_subtype {
+        1 => "unknown",
+        2 => "ifIndex",
+        3 => "sysPort",
+        _ => "if",
+    };
+    match (m.family, m.addr_len) {
+        (1, 4) => format!(
+            "\n\t MngmntADDR:{} ({}/{})",
+            Ipv4Addr::new(m.addr[0], m.addr[1], m.addr[2], m.addr[3]),
+            if_name, m.if_number
+        ),
+        (2, 16) => {
+            let a = m.addr;
+            let ip = Ipv6Addr::from(a);
+            format!("\n\t MngmntADDR:{} ({}/{})", ip, if_name, m.if_number)
+        }
+        _ => format!(
+            "\n\t MngmntADDR:family={} len={} ({}/{})",
+            m.family, m.addr_len, if_name, m.if_number
+        ),
+    }
+}
+
+fn LLDP_OrgSpecific_2_str(tlv: &TLV_DATA) -> String {
+    // Value: OUI(3) + subtype(1) + information string
+    if tlv.tlv_len < 4 {
+        return "\n\t OrgSpecific:(too short)".to_string();
+    }
+    let len = min(tlv.tlv_len as usize, LLDP_TLV_MAX_LEN);
+    let oui = &tlv.tlv_data[0..3];
+    let subtype = tlv.tlv_data[3];
+    let oui_name = match oui {
+        [0x00, 0x80, 0xC2] => "IEEE802.1",
+        [0x00, 0x12, 0xBB] => "TIA-TR41(MED)",
+        [0x00, 0x00, 0x0C] => "Cisco",
+        _ => "",
+    };
+    let mut s = String::with_capacity(64 + len);
+    if oui_name.is_empty() {
+        write!(
+            &mut s,
+            "\n\t OrgSpecific:OUI[{:02X}:{:02X}:{:02X}] sub={} ",
+            oui[0], oui[1], oui[2], subtype
+        ).ok();
+    } else {
+        write!(
+            &mut s,
+            "\n\t OrgSpecific:{}({:02X}:{:02X}:{:02X}) sub={} ",
+            oui_name, oui[0], oui[1], oui[2], subtype
+        ).ok();
+    }
+    for i in 4..len {
+        let byte = tlv.tlv_data[i];
+        if byte.is_ascii_graphic() || byte.is_ascii_whitespace() {
+            s.push(byte as char);
+        } else {
+            write!(&mut s, "{:02X}", byte).ok();
+        }
+    }
+    s
+}
+
 impl fmt::Display for LLDP_Data {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "LLDP[{} {} TTL({}) {}\n\t {} {}\n\t Sys_CAP({}) {}]",
-               TLV_DATA_2_str(&self.Chassis_ID     , "Chassis:"),
-               TLV_DATA_2_str(&self.Port_ID        , "Port:"),
-               self.TTL,
-               TLV_DATA_2_str(&self.Port_DESC      , "\n\t Port_DESC:"),
-               TLV_DATA_2_str(&self.Sys_NAME       , "\n\t Sys_NAME:"),
-               TLV_DATA_2_str(&self.Sys_DESC       , "\n\t Sys_DESC:"),
-                self.Sys_CAP_supported,
-               TLV_DATA_2_str(&self.Management_Addr, "\n\t MngmntADDR:"),
-        )
+        write!(f, "LLDP[TTL({}) Sys_CAP({})\n\t", self.TTL, self.Sys_CAP_supported)?;
+
+        for tlv in &self.tlvs {
+            if tlv.tlv_type == 127 {
+                write!(f, "{}", LLDP_OrgSpecific_2_str(tlv))?;
+                continue;
+            }
+            let prefix = match tlv.tlv_type {
+                1 => " Chassis:",
+                2 => " Port:",
+                4 => "\n\t Port_DESC:",
+                5 => "\n\t Sys_NAME:",
+                6 => "\n\t Sys_DESC:",
+                _ => "\n\t UnknownTLV:",
+            };
+            write!(f, "{}", TLV_DATA_2_str(tlv, prefix))?;
+        }
+        for m in &self.mgmt_addrs {
+            write!(f, "{}", LLDP_MgmtAddr_2_str(m))?;
+        }
+        write!(f, "]")
     }
 }
 
