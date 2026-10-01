@@ -43,11 +43,196 @@ impl fmt::Display for IpType {
             IpType::Udp              => write!(f, "UDP"),
             IpType::Icmp4            => write!(f, "ICMPv4"),
             IpType::Icmp6            => write!(f, "ICMPv6"),
+            IpType::Igmp             => write!(f, "IGMP"),
+            IpType::Esp              => write!(f, "ESP"),
             IpType::Unsupported      => write!(f, "Unsupported"),
         }
     }
 }
 
+impl fmt::Display for IgmpType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            IgmpType::Query      => write!(f, "IGMP Query"),
+            IgmpType::V1Query    => write!(f, "IGMPv1 Query"),
+            IgmpType::V1Report   => write!(f, "IGMPv1 Report"),
+            IgmpType::V2Query    => write!(f, "IGMPv2 Query"),
+            IgmpType::V2Report   => write!(f, "IGMPv2 Report"),
+            IgmpType::V2Leave    => write!(f, "IGMPv2 Leave"),
+            IgmpType::V3Query    => write!(f, "IGMPv3 Query"),
+            IgmpType::V3Report   => write!(f, "IGMPv3 Report"),
+            IgmpType::Unknown(t) => write!(f, "IGMP type 0x{:02x}", t),
+        }
+    }
+}
+
+impl fmt::Display for IgmpV3RecordType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            IgmpV3RecordType::ModeIsInclude   => write!(f, "MODE_IS_INCLUDE"),
+            IgmpV3RecordType::ModeIsExclude   => write!(f, "MODE_IS_EXCLUDE"),
+            IgmpV3RecordType::ChangeToInclude => write!(f, "CHANGE_TO_INCLUDE"),
+            IgmpV3RecordType::ChangeToExclude => write!(f, "CHANGE_TO_EXCLUDE"),
+            IgmpV3RecordType::AllowNewSources => write!(f, "ALLOW_NEW_SOURCES"),
+            IgmpV3RecordType::BlockOldSources => write!(f, "BLOCK_OLD_SOURCES"),
+            IgmpV3RecordType::Unknown(t)      => write!(f, "record 0x{:02x}", t),
+        }
+    }
+}
+
+impl fmt::Display for IgmpData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            IgmpData::V1Query(v)  => write!(f, "IGMPv1 Query group={}", v.group),
+            IgmpData::V1Report(v) => write!(f, "IGMPv1 Report group={}", v.group),
+            IgmpData::V2Query(v)  => write!(f, "IGMPv2 Query group={} max_resp={}", v.group, v.max_resp_time),
+            IgmpData::V2Report(v) => write!(f, "IGMPv2 Report group={}", v.group),
+            IgmpData::V2Leave(v)  => write!(f, "IGMPv2 Leave group={}", v.group),
+            IgmpData::V3Query(v)  => write!(
+                f, "IGMPv3 Query group={} sources={} S={} QRV={} QQIC={}",
+                v.group, v.sources.len(), v.suppress_router_processing, v.qrv, v.qqic
+            ),
+            IgmpData::V3Report(v) => write!(f, "IGMPv3 Report records={}", v.records.len()),
+        }
+    }
+}
+
+impl fmt::Display for EspData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SPI=0x{:08X}", self.spi)
+    }
+}
+
+impl fmt::Display for Dhcp4Msg {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Dhcp4Msg::Discover => write!(f, "Discover"),
+            Dhcp4Msg::Offer    => write!(f, "Offer"),
+            Dhcp4Msg::Request  => write!(f, "Request"),
+            Dhcp4Msg::Decline  => write!(f, "Decline"),
+            Dhcp4Msg::Ack      => write!(f, "Ack"),
+            Dhcp4Msg::Nak      => write!(f, "Nak"),
+            Dhcp4Msg::Release  => write!(f, "Release"),
+            Dhcp4Msg::Inform   => write!(f, "Inform"),
+            Dhcp4Msg::Other(c) => write!(f, "type {}", c),
+        }
+    }
+}
+
+impl fmt::Display for UdpApp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            UdpApp::Dhcp4      => write!(f, "DHCP"),
+            UdpApp::Dhcp6      => write!(f, "DHCPv6"),
+            UdpApp::Dns        => write!(f, "DNS"),
+            UdpApp::Mdns       => write!(f, "mDNS"),
+            UdpApp::Ssdp       => write!(f, "SSDP"),
+            UdpApp::Llmnr      => write!(f, "LLMNR"),
+            UdpApp::Ntp        => write!(f, "NTP"),
+            UdpApp::Quic       => write!(f, "QUIC"),
+            UdpApp::Wireguard  => write!(f, "WireGuard"),
+            UdpApp::EspOverUdp => write!(f, "ESP-UDP"),
+            UdpApp::Other      => write!(f, "UDP"),
+        }
+    }
+}
+
+impl fmt::Display for Icmp4Type {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Icmp4Type::EchoReply           => write!(f, "ICMPv4 Echo Reply"),
+            Icmp4Type::DestUnreach         => write!(f, "ICMPv4 Dest Unreach"),
+            Icmp4Type::Redirect            => write!(f, "ICMPv4 Redirect"),
+            Icmp4Type::EchoRequest         => write!(f, "ICMPv4 Echo Request"),
+            Icmp4Type::RouterAdvertisement => write!(f, "ICMPv4 Router Advertisement"),
+            Icmp4Type::RouterSolicitation  => write!(f, "ICMPv4 Router Solicitation"),
+            Icmp4Type::TimeExceeded        => write!(f, "ICMPv4 Time Exceeded"),
+            Icmp4Type::ParamProblem        => write!(f, "ICMPv4 Param Problem"),
+            Icmp4Type::Timestamp           => write!(f, "ICMPv4 Timestamp"),
+            Icmp4Type::TimestampReply      => write!(f, "ICMPv4 Timestamp Reply"),
+            Icmp4Type::Unknown(t)          => write!(f, "ICMPv4 type {}", t),
+        }
+    }
+}
+
+impl fmt::Display for Icmp4Data {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Icmp4Data::EchoRequest { id, seq } => write!(f, "Echo Request id={} seq={}", id, seq),
+            Icmp4Data::EchoReply { id, seq }   => write!(f, "Echo Reply id={} seq={}", id, seq),
+            Icmp4Data::DestUnreach { code, mtu: Some(mtu) } => write!(f, "Dest Unreach code={} mtu={}", code, mtu),
+            Icmp4Data::DestUnreach { code, mtu: None } => write!(f, "Dest Unreach code={}", code),
+            Icmp4Data::TimeExceeded { code } => write!(f, "Time Exceeded code={}", code),
+            Icmp4Data::ParamProblem { code, pointer } => write!(f, "Param Problem code={} pointer={}", code, pointer),
+            Icmp4Data::Redirect { code, gateway } => write!(f, "Redirect code={} gateway={}", code, gateway),
+            Icmp4Data::Timestamp { id, seq, originate, receive, transmit } => write!(
+                f, "Timestamp id={} seq={} originate={} receive={} transmit={}", id, seq, originate, receive, transmit
+            ),
+            Icmp4Data::TimestampReply { id, seq, originate, receive, transmit } => write!(
+                f, "Timestamp Reply id={} seq={} originate={} receive={} transmit={}", id, seq, originate, receive, transmit
+            ),
+            Icmp4Data::RouterAdvertisement { num_addrs, addr_entry_size, lifetime } => write!(
+                f, "Router Advertisement addrs={} entry={} lifetime={}", num_addrs, addr_entry_size, lifetime
+            ),
+            Icmp4Data::RouterSolicitation => write!(f, "Router Solicitation"),
+            Icmp4Data::Unknown { type_u8, code } => write!(f, "ICMPv4 type={} code={}", type_u8, code),
+        }
+    }
+}
+
+impl fmt::Display for Icmp6Type {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Icmp6Type::DestUnreach           => write!(f, "ICMPv6 Dest Unreach"),
+            Icmp6Type::PacketTooBig          => write!(f, "ICMPv6 Packet Too Big"),
+            Icmp6Type::TimeExceeded          => write!(f, "ICMPv6 Time Exceeded"),
+            Icmp6Type::ParamProblem          => write!(f, "ICMPv6 Param Problem"),
+            Icmp6Type::EchoRequest           => write!(f, "ICMPv6 Echo Request"),
+            Icmp6Type::EchoReply             => write!(f, "ICMPv6 Echo Reply"),
+            Icmp6Type::MldQuery              => write!(f, "MLD Query"),
+            Icmp6Type::MldReport             => write!(f, "MLD Report"),
+            Icmp6Type::MldDone               => write!(f, "MLD Done"),
+            Icmp6Type::MldV2Report           => write!(f, "MLDv2 Report"),
+            Icmp6Type::RouterSolicitation    => write!(f, "Router Solicitation"),
+            Icmp6Type::RouterAdvertisement   => write!(f, "Router Advertisement"),
+            Icmp6Type::NeighborSolicitation  => write!(f, "Neighbor Solicitation"),
+            Icmp6Type::NeighborAdvertisement => write!(f, "Neighbor Advertisement"),
+            Icmp6Type::Redirect              => write!(f, "Redirect"),
+            Icmp6Type::Unknown(t)            => write!(f, "ICMPv6 type {}", t),
+        }
+    }
+}
+
+impl fmt::Display for Icmp6Data {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Icmp6Data::EchoRequest { id, seq } => write!(f, "Echo Request id={} seq={}", id, seq),
+            Icmp6Data::EchoReply { id, seq }   => write!(f, "Echo Reply id={} seq={}", id, seq),
+            Icmp6Data::DestUnreach { code }    => write!(f, "Dest Unreach code={}", code),
+            Icmp6Data::PacketTooBig { mtu }    => write!(f, "Packet Too Big mtu={}", mtu),
+            Icmp6Data::TimeExceeded { code }   => write!(f, "Time Exceeded code={}", code),
+            Icmp6Data::ParamProblem { code }   => write!(f, "Param Problem code={}", code),
+            Icmp6Data::RouterSolicitation     => write!(f, "Router Solicitation"),
+            Icmp6Data::RouterAdvertisement { hop_limit, managed, other_config, lifetime } => write!(
+                f, "Router Advertisement hop={} M={} O={} lifetime={}", hop_limit, managed, other_config, lifetime
+            ),
+            Icmp6Data::NeighborSolicitation { target } => write!(f, "Neighbor Solicitation target={}", target),
+            Icmp6Data::NeighborAdvertisement { router, solicited, override_flag, target } => write!(
+                f, "Neighbor Advertisement target={} R={} S={} O={}", target, router, solicited, override_flag
+            ),
+            Icmp6Data::Redirect { target, destination } => write!(
+                f, "Redirect target={} dest={}", target, destination
+            ),
+            Icmp6Data::MldQuery { max_resp_delay, group } => write!(
+                f, "MLD Query group={} max_resp={}", group, max_resp_delay
+            ),
+            Icmp6Data::MldReport { group } => write!(f, "MLD Report group={}", group),
+            Icmp6Data::MldDone { group }   => write!(f, "MLD Done group={}", group),
+            Icmp6Data::MldV2Report         => write!(f, "MLDv2 Report"),
+            Icmp6Data::Unknown { type_u8, code } => write!(f, "ICMPv6 type={} code={}", type_u8, code),
+        }
+    }
+}
 fn dir_2_str(d: EDirection) -> &'static str {
     match d {
         EDirection::Incoming  => "-->",
@@ -139,8 +324,38 @@ impl fmt::Display for ArpData {
 
 impl fmt::Display for IpData {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "IP[{}({}bytes), src:{}:{} --> dst:{}:{}]",
-            self.protocol, self.len, self.src, self.src_port, self.dst, self.dst_port)
+        match &self.l4 {
+            IpL4::Igmp(igmp) => write!(f, "IP[{}({}bytes), src:{} --> dst:{}, {}]",
+                IpType::Igmp, self.len, self.src, self.dst, igmp),
+            IpL4::Icmp6(msg) => write!(f, "IP[{}({}bytes), src:{} --> dst:{}, {}]",
+                IpType::Icmp6, self.len, self.src, self.dst, msg),
+            IpL4::Icmp4(msg) => write!(f, "IP[{}({}bytes), src:{} --> dst:{}, {}]",
+                IpType::Icmp4, self.len, self.src, self.dst, msg),
+            IpL4::Esp(esp) => write!(f, "IP[{}({}bytes), src:{} --> dst:{}, {}]",
+                IpType::Esp, self.len, self.src, self.dst, esp),
+            IpL4::Udp { src_port, dst_port, app, msg } if *app != UdpApp::Other => match msg {
+                Some(UdpMsg::Query(name)) => write!(
+                    f, "IP[UDP/{} q={}({}bytes), src:{}:{} --> dst:{}:{}]",
+                    app, name, self.len, self.src, src_port, self.dst, dst_port
+                ),
+                Some(UdpMsg::Dhcp4 { msg: Some(m) }) => write!(
+                    f, "IP[UDP/{} {}({}bytes), src:{}:{} --> dst:{}:{}]",
+                    app, m, self.len, self.src, src_port, self.dst, dst_port
+                ),
+                _ => write!(f, "IP[UDP/{}({}bytes), src:{}:{} --> dst:{}:{}]",
+                    app, self.len, self.src, src_port, self.dst, dst_port),
+            },
+            IpL4::Tcp { src_port, dst_port } => write!(
+                f, "IP[{}({}bytes), src:{}:{} --> dst:{}:{}]",
+                IpType::Tcp, self.len, self.src, src_port, self.dst, dst_port
+            ),
+            IpL4::Udp { src_port, dst_port, .. } => write!(
+                f, "IP[{}({}bytes), src:{}:{} --> dst:{}:{}]",
+                IpType::Udp, self.len, self.src, src_port, self.dst, dst_port
+            ),
+            IpL4::Other(t) => write!(f, "IP[{}({}bytes), src:{} --> dst:{}]",
+                t, self.len, self.src, self.dst),
+        }
     }
 }
 impl fmt::Display for MplsData {
@@ -349,11 +564,17 @@ impl fmt::Display for ParseError {
             ParseError::Udp_Broken   { len, src, dst } => write!(
                 f, "UDP payload too short or invalid: {} bytes (src={}, dst={})",   len, src, dst
             ),
-            ParseError::Icmp4_Broken { len, src, dst } => write!(
-                f, "ICMP payload too short or invalid: {} bytes (src={}, dst={})",  len, src, dst
+            ParseError::Icmp4_Broken { len, src, dst, icmp4_type } => write!(
+                f, "{} payload too short or invalid: {} bytes (src={}, dst={})", icmp4_type, len, src, dst
             ),
-            ParseError::Icmp6_Broken { len, src, dst } => write!(
-                f, "ICMPv6 payload too short or invalid: {} bytes (src={}, dst={})",len, src, dst
+            ParseError::Icmp6_Broken { len, src, dst, icmp6_type } => write!(
+                f, "{} payload too short or invalid: {} bytes (src={}, dst={})", icmp6_type, len, src, dst
+            ),
+            ParseError::Igmp_Broken { len, src, dst, igmp_type } => write!(
+                f, "{} payload too short or invalid: {} bytes (src={}, dst={})", igmp_type, len, src, dst
+            ),
+            ParseError::Esp_Broken { len, src, dst } => write!(
+                f, "ESP payload too short: {} bytes (need at least 8, src={}, dst={})", len, src, dst
             ),
             ParseError::Ip4_Fragment { src, dst } => {
                 write!(f, "IPv4 fragment (non-first), L4 unknown (src={}, dst={})", src, dst)

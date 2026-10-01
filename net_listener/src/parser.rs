@@ -124,12 +124,24 @@ fn parse_ethernet_packet(data: common::CapData, own_mac: common::MacAddr6) -> Re
         Ok(r) => {
                 let eth_data = common::EthData { src, dst, dir, prot};
                 let result  = common::NetData { eth: eth_data, payload: r };
-                if prot != common::EthType::Ipv4  &&  prot != common::EthType::Ipv6 {
+                if prot != common::EthType::Ipv4  //&&  prot != common::EthType::Ipv6
+                {
                     println!("{}", result);
                 }
                 Ok(result)
             },
-        Err(e) => return Err(e),
+        Err(e) => {
+            //println!("PARSER: error parse ethernet packet - {:?}", e);
+            let dump_len = min(128, data.data.len());
+            println!("PARSER: packet {} bytes, first {}:", data.data.len(), dump_len);
+            for (i, b) in data.data[..dump_len].iter().enumerate() {
+                if i % 16 == 0 {
+                    print!("  {:04x}: ", i);
+                }
+                print!("{:02x}{}", b, if i % 16 == 15 || i + 1 == dump_len { "\n" } else { " " });
+            }
+            Err(e)
+        }
     }    
 }
 
@@ -278,26 +290,497 @@ fn parse_l4(
         etherparse::IpNumber::TCP => {
             let (tcp, _) = etherparse::TcpHeader::from_slice(payload)
                 .map_err(|_| common::ParseError::Tcp_Broken { len: payload.len(), src: *src, dst: *dst })?;
-            Ok(common::IpData::new_tcp_udp(common::IpType::Tcp, src, dst, payload.len(),
+            Ok(common::IpData::new_tcp(src, dst, payload.len(),
                                          tcp.source_port, tcp.destination_port))
         }
         etherparse::IpNumber::UDP => {
-            let (udp, _) = etherparse::UdpHeader::from_slice(payload)
+            let (udp, rest) = etherparse::UdpHeader::from_slice(payload)
                 .map_err(|_| common::ParseError::Udp_Broken { len: payload.len(), src: *src, dst: *dst })?;
-            Ok(common::IpData::new_tcp_udp(common::IpType::Udp, src, dst, payload.len(),
-                                         udp.source_port, udp.destination_port))
+            let mut data = common::IpData::new_udp(src, dst, payload.len(),
+                                         udp.source_port, udp.destination_port);
+            confirm_udp_body(&mut data, udp_payload_slice(udp.length, rest));
+            Ok(data)
         }
-        etherparse::IpNumber::ICMP => {
-            etherparse::Icmpv4Header::from_slice(payload)
-                .map_err(|_| common::ParseError::Icmp4_Broken { len: payload.len(), src: *src, dst: *dst })?;
-            Ok(common::IpData::new_icmp4(src, dst, payload.len()))
-        }
-        etherparse::IpNumber::IPV6_ICMP => {
-            etherparse::Icmpv6Header::from_slice(payload)
-                .map_err(|_| common::ParseError::Icmp6_Broken { len: payload.len(), src: *src, dst: *dst })?;
-            Ok(common::IpData::new_icmp6(src, dst, payload.len()))
-        }
+        etherparse::IpNumber::ICMP => parse_icmp4(payload, src, dst),
+        etherparse::IpNumber::IPV6_ICMP => parse_icmp6(payload, src, dst),
+        etherparse::IpNumber::IGMP => parse_igmp(payload, src, dst),
+        etherparse::IpNumber::ENCAPSULATING_SECURITY_PAYLOAD => parse_esp(payload, src, dst),
         other => Err(common::ParseError::Unsupported_L4 { id: other.0 }),
+    }
+}
+
+/// Тело UDP по полю length. Если захват короче заявленного, берётся весь хвост.
+fn udp_payload_slice(length: u16, rest: &[u8]) -> &[u8] {
+    let declared = (length as usize).saturating_sub(etherparse::UdpHeader::LEN);
+    if declared <= rest.len() { &rest[..declared] } else { rest }
+}
+
+/// DNS/mDNS/LLMNR: первое имя вопроса. DHCP: magic cookie и опция 53.
+/// Тело не сошлось — ярлык по порту снимается, пакет остаётся обычным UDP.
+fn confirm_udp_body(data: &mut common::IpData, body: &[u8]) {
+    let common::IpL4::Udp { app, msg, .. } = &mut data.l4 else { return };
+    match *app {
+        common::UdpApp::Dhcp4 => match parse_dhcp4(body) {
+            Some(m) => *msg = Some(common::UdpMsg::Dhcp4 { msg: m }),
+            None => *app = common::UdpApp::Other,
+        },
+        common::UdpApp::Dns | common::UdpApp::Mdns | common::UdpApp::Llmnr => match parse_dns_qname(body) {
+            Ok(Some(name)) => *msg = Some(common::UdpMsg::Query(name)),
+            Ok(None) => {}
+            Err(()) => *app = common::UdpApp::Other,
+        },
+        _ => {}
+    }
+}
+
+const DNS_HEADER_LEN: usize = 12;
+const DNS_PTR_HOPS: usize = 8;
+const DHCP4_COOKIE_AT: usize = 236;
+const DHCP4_OPTIONS_AT: usize = 240;
+const DHCP4_COOKIE: [u8; 4] = [0x63, 0x82, 0x53, 0x63];
+const DHCP4_OPT_MSG_TYPE: u8 = 53;
+const DHCP4_OPT_END: u8 = 255;
+const DHCP4_OPT_PAD: u8 = 0;
+
+/// `Ok(None)` — заголовок DNS есть, вопросов нет. `Err` — это не DNS.
+fn parse_dns_qname(body: &[u8]) -> Result<Option<heapless::String<{ common::UDP_QNAME_MAX }>>, ()> {
+    if body.len() < DNS_HEADER_LEN {
+        return Err(());
+    }
+    let qd = u16::from_be_bytes([body[4], body[5]]);
+    if qd == 0 {
+        return Ok(None);
+    }
+    let (name, end) = read_dns_name(body, DNS_HEADER_LEN)?;
+    if end + 4 > body.len() {
+        return Err(());
+    }
+    Ok(Some(name))
+}
+
+/// Имя с позиции `pos`. Второе значение — где кончается имя на проводе, без учёта прыжков по указателям.
+fn read_dns_name(packet: &[u8], mut pos: usize) -> Result<(heapless::String<{ common::UDP_QNAME_MAX }>, usize), ()> {
+    let mut out = heapless::String::new();
+    let mut hops = 0usize;
+    let mut end = None;
+    let mut steps = 0usize;
+    loop {
+        if pos >= packet.len() || steps > packet.len() {
+            return Err(());
+        }
+        steps += 1;
+        let len = packet[pos];
+        if len == 0 {
+            if end.is_none() {
+                end = Some(pos + 1);
+            }
+            break;
+        }
+        if len & 0xC0 == 0xC0 {
+            if pos + 1 >= packet.len() {
+                return Err(());
+            }
+            if end.is_none() {
+                end = Some(pos + 2);
+            }
+            hops += 1;
+            if hops > DNS_PTR_HOPS {
+                return Err(());
+            }
+            let off = (((len as usize) & 0x3F) << 8) | packet[pos + 1] as usize;
+            if off >= packet.len() {
+                return Err(());
+            }
+            pos = off;
+            continue;
+        }
+        if len & 0xC0 != 0 {
+            return Err(());
+        }
+        let n = len as usize;
+        pos += 1;
+        if pos + n > packet.len() {
+            return Err(());
+        }
+        push_dns_label(&mut out, &packet[pos..pos + n]);
+        pos += n;
+    }
+    if out.is_empty() {
+        let _ = out.push('.');
+    }
+    Ok((out, end.ok_or(())?))
+}
+
+fn push_dns_label(out: &mut heapless::String<{ common::UDP_QNAME_MAX }>, label: &[u8]) {
+    if !out.is_empty() && out.push('.').is_err() {
+        return;
+    }
+    for &b in label {
+        let c = if b.is_ascii_graphic() { b as char } else { '?' };
+        if out.push(c).is_err() {
+            return;
+        }
+    }
+}
+
+/// `Some(None)` — cookie есть, опции 53 в срезе нет. `None` — это не DHCP.
+fn parse_dhcp4(body: &[u8]) -> Option<Option<common::Dhcp4Msg>> {
+    if body.len() < DHCP4_OPTIONS_AT || body[DHCP4_COOKIE_AT..DHCP4_OPTIONS_AT] != DHCP4_COOKIE {
+        return None;
+    }
+    let mut i = DHCP4_OPTIONS_AT;
+    while i < body.len() {
+        let code = body[i];
+        if code == DHCP4_OPT_END {
+            break;
+        }
+        if code == DHCP4_OPT_PAD {
+            i += 1;
+            continue;
+        }
+        if i + 1 >= body.len() {
+            break;
+        }
+        let len = body[i + 1] as usize;
+        if i + 2 + len > body.len() {
+            break;
+        }
+        if code == DHCP4_OPT_MSG_TYPE && len >= 1 {
+            return Some(Some(common::Dhcp4Msg::from_u8(body[i + 2])));
+        }
+        i += 2 + len;
+    }
+    Some(None)
+}
+
+/// ESP: SPI из первых 4 байт. Sequence и ciphertext не читаются.
+/// Короче 8 байт — заголовок неполный, SPI не сохраняется.
+fn parse_esp(
+    payload: &[u8],
+    src: &common::IpAddr,
+    dst: &common::IpAddr,
+) -> Result<common::IpData, common::ParseError> {
+    if payload.len() < common::ESP_MIN_LEN {
+        return Err(common::ParseError::Esp_Broken {
+            len: payload.len(),
+            src: *src,
+            dst: *dst,
+        });
+    }
+    let spi = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    Ok(common::IpData::new_esp(src, dst, payload.len(), common::EspData { spi }))
+}
+
+/// ICMPv4: etherparse читает фиксированный заголовок. Вложенный IP и адреса RA не разбираются.
+/// Timestamp (тип 13/14, code 0) etherparse принимает только при длине ровно 20 байт.
+fn parse_icmp4(
+    payload: &[u8],
+    src: &common::IpAddr,
+    dst: &common::IpAddr,
+) -> Result<common::IpData, common::ParseError> {
+    let (hdr, _) = etherparse::Icmpv4Header::from_slice(payload)
+        .map_err(|_| icmp4_broken(payload, src, dst))?;
+    Ok(common::IpData::new_icmp4(src, dst, payload.len(), parse_icmp4_msg(&hdr.icmp_type)))
+}
+
+fn icmp4_broken(
+    payload: &[u8],
+    src: &common::IpAddr,
+    dst: &common::IpAddr,
+) -> common::ParseError {
+    common::ParseError::Icmp4_Broken {
+        len: payload.len(),
+        src: *src,
+        dst: *dst,
+        icmp4_type: common::Icmp4Type::from_payload(payload),
+    }
+}
+
+fn parse_icmp4_msg(icmp_type: &etherparse::Icmpv4Type) -> common::Icmp4Data {
+    use etherparse::Icmpv4Type;
+    match icmp_type {
+        Icmpv4Type::EchoRequest(e) => common::Icmp4Data::EchoRequest { id: e.id, seq: e.seq },
+        Icmpv4Type::EchoReply(e)   => common::Icmp4Data::EchoReply { id: e.id, seq: e.seq },
+        Icmpv4Type::DestinationUnreachable(h) => {
+            let mtu = match h {
+                etherparse::icmpv4::DestUnreachableHeader::FragmentationNeeded { next_hop_mtu } => Some(*next_hop_mtu),
+                _ => None,
+            };
+            common::Icmp4Data::DestUnreach { code: h.code_u8(), mtu }
+        }
+        Icmpv4Type::TimeExceeded(code) => common::Icmp4Data::TimeExceeded { code: code.code_u8() },
+        Icmpv4Type::ParameterProblem(h) => {
+            // RFC 792 / 4884: 0 — pointer, 1 — missing option, 2 — bad length.
+            use etherparse::icmpv4::ParameterProblemHeader::*;
+            let (code, pointer) = match h {
+                PointerIndicatesError(p) => (0, *p),
+                MissingRequiredOption    => (1, 0),
+                BadLength                => (2, 0),
+            };
+            common::Icmp4Data::ParamProblem { code, pointer }
+        }
+        Icmpv4Type::Redirect(h) => common::Icmp4Data::Redirect {
+            code: h.code.code_u8(),
+            gateway: common::Ipv4Addr::from(h.gateway_internet_address),
+        },
+        Icmpv4Type::TimestampRequest(m) => common::Icmp4Data::Timestamp {
+            id: m.id, seq: m.seq,
+            originate: m.originate_timestamp, receive: m.receive_timestamp, transmit: m.transmit_timestamp,
+        },
+        Icmpv4Type::TimestampReply(m) => common::Icmp4Data::TimestampReply {
+            id: m.id, seq: m.seq,
+            originate: m.originate_timestamp, receive: m.receive_timestamp, transmit: m.transmit_timestamp,
+        },
+        // etherparse 0.19 отдаёт RA/RS как Unknown
+        Icmpv4Type::Unknown { type_u8, code_u8, bytes5to8 } => match *type_u8 {
+            common::ICMP4_TYPE_RA => common::Icmp4Data::RouterAdvertisement {
+                num_addrs: bytes5to8[0],
+                addr_entry_size: bytes5to8[1],
+                lifetime: u16::from_be_bytes([bytes5to8[2], bytes5to8[3]]),
+            },
+            common::ICMP4_TYPE_RS => common::Icmp4Data::RouterSolicitation,
+            _ => common::Icmp4Data::Unknown { type_u8: *type_u8, code: *code_u8 },
+        },
+    }
+}
+
+/// IGMP: тип по первому байту, версия Query — по длине и Max Resp Time.
+/// v1/v2 — 8 байт; v3 Query — от 12; v3 Report — от 8 плюс group records.
+fn parse_igmp(
+    payload: &[u8],
+    src: &common::IpAddr,
+    dst: &common::IpAddr,
+) -> Result<common::IpData, common::ParseError> {
+    let igmp_type = common::IgmpType::from_payload(payload);
+    match parse_igmp_msg(payload, igmp_type) {
+        Some(msg) => Ok(common::IpData::new_igmp(src, dst, payload.len(), msg)),
+        None => Err(common::ParseError::Igmp_Broken {
+            len: payload.len(),
+            src: *src,
+            dst: *dst,
+            igmp_type,
+        }),
+    }
+}
+
+fn igmp_checksum_group(payload: &[u8]) -> (u16, common::Ipv4Addr) {
+    let checksum = u16::from_be_bytes([payload[2], payload[3]]);
+    let group = common::Ipv4Addr::new(payload[4], payload[5], payload[6], payload[7]);
+    (checksum, group)
+}
+
+fn igmp_push_sources(
+    out: &mut heapless::Vec<common::Ipv4Addr, { common::IGMP_V3_MAX_SOURCES }>,
+    bytes: &[u8],
+    nsrc: usize,
+) -> Option<usize> {
+    let need = nsrc.checked_mul(4)?;
+    if bytes.len() < need {
+        return None;
+    }
+    let store = min(nsrc, common::IGMP_V3_MAX_SOURCES);
+    for i in 0..store {
+        let o = i * 4;
+        let _ = out.push(common::Ipv4Addr::new(bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]));
+    }
+    Some(need)
+}
+
+fn parse_igmp_v1v2(payload: &[u8]) -> Option<(u8, u16, common::Ipv4Addr)> {
+    if payload.len() < common::IGMP_V1V2_LEN {
+        return None;
+    }
+    let (checksum, group) = igmp_checksum_group(payload);
+    Some((payload[1], checksum, group))
+}
+
+fn parse_igmp_v3_query(payload: &[u8]) -> Option<common::IgmpV3Query> {
+    if payload.len() < common::IGMP_V3_QUERY_MIN_LEN {
+        return None;
+    }
+    let (checksum, group) = igmp_checksum_group(payload);
+    let flags = payload[8];
+    let nsrc = u16::from_be_bytes([payload[10], payload[11]]) as usize;
+    let mut sources = heapless::Vec::new();
+    igmp_push_sources(&mut sources, &payload[12..], nsrc)?;
+    Some(common::IgmpV3Query {
+        max_resp_code: payload[1],
+        checksum,
+        group,
+        suppress_router_processing: flags & 0x08 != 0,
+        qrv: flags & 0x07,
+        qqic: payload[9],
+        sources,
+    })
+}
+
+fn parse_igmp_v3_report(payload: &[u8]) -> Option<common::IgmpV3Report> {
+    if payload.len() < common::IGMP_V3_REPORT_MIN_LEN {
+        return None;
+    }
+    let checksum = u16::from_be_bytes([payload[2], payload[3]]);
+    let nrecords = u16::from_be_bytes([payload[6], payload[7]]) as usize;
+    let mut records = heapless::Vec::new();
+    let mut rest = &payload[8..];
+    for _ in 0..nrecords {
+        if rest.len() < common::IGMP_V3_RECORD_MIN_LEN {
+            return None;
+        }
+        let record_type = common::IgmpV3RecordType::from_u8(rest[0]);
+        let aux_len = rest[1] as usize * 4;
+        let nsrc = u16::from_be_bytes([rest[2], rest[3]]) as usize;
+        let multicast = common::Ipv4Addr::new(rest[4], rest[5], rest[6], rest[7]);
+        rest = &rest[8..];
+        let mut sources = heapless::Vec::new();
+        let src_bytes = igmp_push_sources(&mut sources, rest, nsrc)?;
+        rest = &rest[src_bytes..];
+        if rest.len() < aux_len {
+            return None;
+        }
+        rest = &rest[aux_len..];
+        let _ = records.push(common::IgmpV3GroupRecord { record_type, multicast, sources });
+    }
+    Some(common::IgmpV3Report { checksum, records })
+}
+
+fn parse_igmp_msg(payload: &[u8], igmp_type: common::IgmpType) -> Option<common::IgmpData> {
+    match igmp_type {
+        common::IgmpType::V1Query => {
+            let (_, checksum, group) = parse_igmp_v1v2(payload)?;
+            Some(common::IgmpData::V1Query(common::IgmpV1 { checksum, group }))
+        }
+        common::IgmpType::V1Report => {
+            let (_, checksum, group) = parse_igmp_v1v2(payload)?;
+            Some(common::IgmpData::V1Report(common::IgmpV1 { checksum, group }))
+        }
+        common::IgmpType::V2Query => {
+            let (max_resp_time, checksum, group) = parse_igmp_v1v2(payload)?;
+            Some(common::IgmpData::V2Query(common::IgmpV2 { max_resp_time, checksum, group }))
+        }
+        common::IgmpType::V2Report => {
+            let (max_resp_time, checksum, group) = parse_igmp_v1v2(payload)?;
+            Some(common::IgmpData::V2Report(common::IgmpV2 { max_resp_time, checksum, group }))
+        }
+        common::IgmpType::V2Leave => {
+            let (max_resp_time, checksum, group) = parse_igmp_v1v2(payload)?;
+            Some(common::IgmpData::V2Leave(common::IgmpV2 { max_resp_time, checksum, group }))
+        }
+        common::IgmpType::V3Query => parse_igmp_v3_query(payload).map(common::IgmpData::V3Query),
+        common::IgmpType::V3Report => parse_igmp_v3_report(payload).map(common::IgmpData::V3Report),
+        common::IgmpType::Query | common::IgmpType::Unknown(_) => None,
+    }
+}
+
+fn icmp6_broken(
+    payload: &[u8],
+    src: &common::IpAddr,
+    dst: &common::IpAddr,
+) -> common::ParseError {
+    common::ParseError::Icmp6_Broken {
+        len: payload.len(),
+        src: *src,
+        dst: *dst,
+        icmp6_type: common::Icmp6Type::from_payload(payload),
+    }
+}
+
+fn ipv6_addr_from(bytes: &[u8]) -> Option<common::Ipv6Addr> {
+    if bytes.len() < 16 {
+        return None;
+    }
+    let mut oct = [0u8; 16];
+    oct.copy_from_slice(&bytes[..16]);
+    Some(common::Ipv6Addr::from(oct))
+}
+
+/// ICMPv6: etherparse разбирает известные типы; MLD (130–132, 143) приходит как Unknown.
+/// Target NDP и группа MLD читаются из хвоста после 8-байтного заголовка.
+fn parse_icmp6(
+    payload: &[u8],
+    src: &common::IpAddr,
+    dst: &common::IpAddr,
+) -> Result<common::IpData, common::ParseError> {
+    let (hdr, rest) = etherparse::Icmpv6Header::from_slice(payload)
+        .map_err(|_| icmp6_broken(payload, src, dst))?;
+    match parse_icmp6_msg(&hdr, rest) {
+        Some(msg) => Ok(common::IpData::new_icmp6(src, dst, payload.len(), msg)),
+        None => Err(icmp6_broken(payload, src, dst)),
+    }
+}
+
+fn parse_mld_group(rest: &[u8]) -> Option<common::Ipv6Addr> {
+    ipv6_addr_from(rest)
+}
+
+fn parse_icmp6_msg(
+    hdr: &etherparse::Icmpv6Header,
+    rest: &[u8],
+) -> Option<common::Icmp6Data> {
+    use etherparse::Icmpv6Type;
+    match hdr.icmp_type {
+        Icmpv6Type::EchoRequest(e) => Some(common::Icmp6Data::EchoRequest { id: e.id, seq: e.seq }),
+        Icmpv6Type::EchoReply(e)   => Some(common::Icmp6Data::EchoReply { id: e.id, seq: e.seq }),
+        Icmpv6Type::DestinationUnreachable(_) => Some(common::Icmp6Data::DestUnreach { code: hdr.icmp_type.code_u8() }),
+        Icmpv6Type::PacketTooBig { mtu } => Some(common::Icmp6Data::PacketTooBig { mtu }),
+        Icmpv6Type::TimeExceeded(_) => Some(common::Icmp6Data::TimeExceeded { code: hdr.icmp_type.code_u8() }),
+        Icmpv6Type::ParameterProblem(_) => Some(common::Icmp6Data::ParamProblem { code: hdr.icmp_type.code_u8() }),
+        Icmpv6Type::RouterSolicitation => Some(common::Icmp6Data::RouterSolicitation),
+        Icmpv6Type::RouterAdvertisement(ra) => Some(common::Icmp6Data::RouterAdvertisement {
+            hop_limit: ra.cur_hop_limit,
+            managed: ra.managed_address_config,
+            other_config: ra.other_config,
+            lifetime: ra.router_lifetime,
+        }),
+        Icmpv6Type::NeighborSolicitation => {
+            let target = ipv6_addr_from(rest)?;
+            Some(common::Icmp6Data::NeighborSolicitation { target })
+        }
+        Icmpv6Type::NeighborAdvertisement(na) => {
+            let target = ipv6_addr_from(rest)?;
+            Some(common::Icmp6Data::NeighborAdvertisement {
+                router: na.router,
+                solicited: na.solicited,
+                override_flag: na.r#override,
+                target,
+            })
+        }
+        Icmpv6Type::Redirect => {
+            let target = ipv6_addr_from(rest)?;
+            let destination = ipv6_addr_from(&rest[16..])?;
+            Some(common::Icmp6Data::Redirect { target, destination })
+        }
+        Icmpv6Type::Unknown { type_u8, code_u8, bytes5to8 } => match type_u8 {
+            common::ICMP6_TYPE_MLD_QUERY => {
+                let group = parse_mld_group(rest)?;
+                Some(common::Icmp6Data::MldQuery {
+                    max_resp_delay: u16::from_be_bytes([bytes5to8[0], bytes5to8[1]]),
+                    group,
+                })
+            }
+            common::ICMP6_TYPE_MLD_REPORT => {
+                let group = parse_mld_group(rest)?;
+                Some(common::Icmp6Data::MldReport { group })
+            }
+            common::ICMP6_TYPE_MLD_DONE => {
+                let group = parse_mld_group(rest)?;
+                Some(common::Icmp6Data::MldDone { group })
+            }
+            common::ICMP6_TYPE_MLDV2_REPORT => Some(common::Icmp6Data::MldV2Report),
+            // etherparse 0.19 отдаёт RS/RA/Redirect как Unknown
+            common::ICMP6_TYPE_RS => Some(common::Icmp6Data::RouterSolicitation),
+            common::ICMP6_TYPE_RA => Some(common::Icmp6Data::RouterAdvertisement {
+                hop_limit: bytes5to8[0],
+                managed: bytes5to8[1] & 0x80 != 0,
+                other_config: bytes5to8[1] & 0x40 != 0,
+                lifetime: u16::from_be_bytes([bytes5to8[2], bytes5to8[3]]),
+            }),
+            common::ICMP6_TYPE_REDIRECT => {
+                let target = ipv6_addr_from(rest)?;
+                let destination = ipv6_addr_from(&rest[16..])?;
+                Some(common::Icmp6Data::Redirect { target, destination })
+            }
+            _ => Some(common::Icmp6Data::Unknown { type_u8, code: code_u8 }),
+        },
     }
 }
 
@@ -317,12 +800,15 @@ fn parse_arp(pl: &[u8]) -> Result<common::ArpData, common::ParseError> {
     let arp = etherparse::ArpPacketSlice::from_slice(pl)
         .map_err(|_| common::ParseError::Arp_Broken { len: pl.len() })?;
     let packet = arp.to_packet();
-    let ipv4 = packet.try_eth_ipv4().map_err(|_| common::ParseError::Arp_Unsupported {
-        hw_type: packet.hw_addr_type.0,
-        proto_type: packet.proto_addr_type.0,
-        hw_len: packet.hw_addr_size(),
-        proto_len: packet.protocol_addr_size(),
-    })?;
+    let ipv4 = packet.try_eth_ipv4()
+            .map_err(|_| common::ParseError::Arp_Unsupported
+                {
+                    hw_type: packet.hw_addr_type.0,
+                    proto_type: packet.proto_addr_type.0,
+                    hw_len: packet.hw_addr_size(),
+                    proto_len: packet.protocol_addr_size(),
+                }
+            )?;
 
     let op = match ipv4.operation.0 {
         1 => common::ArpOp::Request,
@@ -1024,9 +1510,10 @@ mod tests {
         packet.extend_from_slice(&[0xAA; 18]);
 
         let data = expect_ip(parse_ipv4(&packet));
-        assert!(data.protocol == common::IpType::Udp);
-        assert_eq!(data.src_port, 12345);
-        assert_eq!(data.dst_port, 53);
+        match data.l4 {
+            common::IpL4::Udp { src_port: 12345, dst_port: 53, .. } => {}
+            other => panic!("expected UDP ports, got {other:?}"),
+        }
         assert_eq!(data.len, 8);
     }
 
@@ -1066,9 +1553,10 @@ mod tests {
         packet.extend_from_slice(&tcp.to_bytes());
 
         let data = expect_ip(parse_ipv4(&packet));
-        assert!(data.protocol == common::IpType::Tcp);
-        assert_eq!(data.src_port, 40000);
-        assert_eq!(data.dst_port, 443);
+        match data.l4 {
+            common::IpL4::Tcp { src_port: 40000, dst_port: 443 } => {}
+            other => panic!("expected TCP ports, got {other:?}"),
+        }
         assert_eq!(data.len, 20);
     }
 
@@ -1086,8 +1574,10 @@ mod tests {
         packet.extend_from_slice(&tcp.to_bytes());
 
         let data = expect_ip(parse_ipv4(&packet));
-        assert_eq!(data.src_port, 1234);
-        assert_eq!(data.dst_port, 80);
+        match data.l4 {
+            common::IpL4::Tcp { src_port: 1234, dst_port: 80 } => {}
+            other => panic!("expected TCP ports, got {other:?}"),
+        }
         assert_eq!(data.len, 20);
     }
 
@@ -1116,9 +1606,10 @@ mod tests {
         packet.extend_from_slice(&tcp.to_bytes());
 
         let data = expect_ip(parse_ipv6(&packet));
-        assert!(data.protocol == common::IpType::Tcp);
-        assert_eq!(data.src_port, 50000);
-        assert_eq!(data.dst_port, 443);
+        match data.l4 {
+            common::IpL4::Tcp { src_port: 50000, dst_port: 443 } => {}
+            other => panic!("expected TCP ports, got {other:?}"),
+        }
         assert_eq!(data.len, 20);
         assert_eq!(data.src, common::IpAddr::from(src));
         assert_eq!(data.dst, common::IpAddr::from(dst));
@@ -1155,5 +1646,566 @@ mod tests {
             Err(e) => panic!("expected Ip6_Fragment, got {e:?}"),
             Ok(_) => panic!("expected Ip6_Fragment"),
         }
+    }
+
+    /// IGMPv2 Membership Report: 8 байт, тип 0x16, групповой адрес в payload.
+    #[test]
+    fn ipv4_igmp_v2_report() {
+        let ip = etherparse::Ipv4Header::new(
+            8, 1, etherparse::IpNumber::IGMP, [10, 0, 0, 1], [224, 0, 0, 22],
+        ).unwrap();
+        // type=0x16 (v2 report), max resp=0, checksum=0, group=239.1.1.1
+        let igmp = [0x16, 0x00, 0x00, 0x00, 239, 1, 1, 1];
+
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&ip.to_bytes());
+        packet.extend_from_slice(&igmp);
+
+        let data = expect_ip(parse_ipv4(&packet));
+        assert_eq!(data.len, 8);
+        match data.l4 {
+            common::IpL4::Igmp(common::IgmpData::V2Report(v)) => {
+                assert_eq!(v.group, common::Ipv4Addr::new(239, 1, 1, 1));
+            }
+            other => panic!("expected V2Report, got {other:?}"),
+        }
+    }
+
+    /// IGMPv1 Query: тип 0x11, Max Resp Time = 0, 8 байт.
+    #[test]
+    fn ipv4_igmp_v1_query() {
+        let ip = etherparse::Ipv4Header::new(
+            8, 1, etherparse::IpNumber::IGMP, [10, 0, 0, 1], [224, 0, 0, 1],
+        ).unwrap();
+        let igmp = [0x11, 0x00, 0x00, 0x00, 0, 0, 0, 0];
+
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&ip.to_bytes());
+        packet.extend_from_slice(&igmp);
+
+        let data = expect_ip(parse_ipv4(&packet));
+        assert!(matches!(data.l4, common::IpL4::Igmp(common::IgmpData::V1Query(_))));
+    }
+
+    /// IGMPv3 Query без источников: 12 байт.
+    #[test]
+    fn ipv4_igmp_v3_query_no_sources() {
+        let ip = etherparse::Ipv4Header::new(
+            12, 1, etherparse::IpNumber::IGMP, [10, 0, 0, 1], [224, 0, 0, 1],
+        ).unwrap();
+        let igmp = [
+            0x11, 0x64, 0x00, 0x00,
+            0, 0, 0, 0,
+            0x02, // S=0, QRV=2
+            0x7D, // QQIC
+            0x00, 0x00, // nsrc=0
+        ];
+
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&ip.to_bytes());
+        packet.extend_from_slice(&igmp);
+
+        let data = expect_ip(parse_ipv4(&packet));
+        match data.l4 {
+            common::IpL4::Igmp(common::IgmpData::V3Query(q)) => {
+                assert_eq!(q.max_resp_code, 0x64);
+                assert_eq!(q.qrv, 2);
+                assert!(q.sources.is_empty());
+            }
+            other => panic!("expected V3Query, got {other:?}"),
+        }
+    }
+
+    /// Обрезанный Query (тип 0x11, 4 байта) — Igmp_Broken с типом Query.
+    #[test]
+    fn ipv4_igmp_too_short() {
+        let ip = etherparse::Ipv4Header::new(
+            4, 1, etherparse::IpNumber::IGMP, [10, 0, 0, 1], [224, 0, 0, 1],
+        ).unwrap();
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&ip.to_bytes());
+        packet.extend_from_slice(&[0x11, 0x00, 0x00, 0x00]);
+
+        match parse_ipv4(&packet) {
+            Err(common::ParseError::Igmp_Broken { igmp_type: common::IgmpType::Query, .. }) => {}
+            Err(e) => panic!("expected Igmp_Broken Query, got {e:?}"),
+            Ok(_) => panic!("expected Igmp_Broken"),
+        }
+    }
+
+    /// Обрезанный IGMPv3 Query (10 байт вместо 12) — Igmp_Broken с типом V3Query.
+    #[test]
+    fn ipv4_igmp_v3_query_truncated() {
+        let ip = etherparse::Ipv4Header::new(
+            10, 1, etherparse::IpNumber::IGMP, [10, 0, 0, 1], [224, 0, 0, 1],
+        ).unwrap();
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&ip.to_bytes());
+        packet.extend_from_slice(&[0x11, 0x64, 0, 0, 0, 0, 0, 0, 0x02, 0x7D]);
+
+        match parse_ipv4(&packet) {
+            Err(common::ParseError::Igmp_Broken { igmp_type: common::IgmpType::V3Query, .. }) => {}
+            Err(e) => panic!("expected Igmp_Broken V3Query, got {e:?}"),
+            Ok(_) => panic!("expected Igmp_Broken"),
+        }
+    }
+
+    fn ipv4_udp_ports(src_port: u16, dst_port: u16) -> common::IpData {
+        let ip = etherparse::Ipv4Header::new(
+            8, 64, etherparse::IpNumber::UDP, [10, 0, 0, 1], [10, 0, 0, 2],
+        ).unwrap();
+        let udp = etherparse::UdpHeader {
+            source_port: src_port,
+            destination_port: dst_port,
+            length: 8,
+            checksum: 0,
+        };
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&ip.to_bytes());
+        packet.extend_from_slice(&udp.to_bytes());
+        expect_ip(parse_ipv4(&packet))
+    }
+
+    fn ipv4_udp(src_port: u16, dst_port: u16, body: &[u8]) -> common::IpData {
+        let udp_len = (8 + body.len()) as u16;
+        let ip = etherparse::Ipv4Header::new(
+            udp_len, 64, etherparse::IpNumber::UDP, [10, 0, 0, 1], [10, 0, 0, 2],
+        ).unwrap();
+        let udp = etherparse::UdpHeader {
+            source_port: src_port,
+            destination_port: dst_port,
+            length: udp_len,
+            checksum: 0,
+        };
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&ip.to_bytes());
+        packet.extend_from_slice(&udp.to_bytes());
+        packet.extend_from_slice(body);
+        expect_ip(parse_ipv4(&packet))
+    }
+
+    fn dns_query(name: &str) -> Vec<u8> {
+        let mut body = vec![0u8; 12];
+        body[5] = 1;
+        for label in name.split('.') {
+            body.push(label.len() as u8);
+            body.extend_from_slice(label.as_bytes());
+        }
+        body.push(0);
+        body.extend_from_slice(&[0, 1, 0, 1]);
+        body
+    }
+
+    fn dhcp4_with_options(options: &[u8]) -> Vec<u8> {
+        let mut body = vec![0u8; 240];
+        body[0] = 1;
+        body[236..240].copy_from_slice(&[0x63, 0x82, 0x53, 0x63]);
+        body.extend_from_slice(options);
+        body
+    }
+
+    fn ipv6_l4(next: etherparse::IpNumber, l4: &[u8]) -> Result<common::NetPayload, common::ParseError> {
+        let src = [0x20, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let dst = [0x20, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+        let ip = etherparse::Ipv6Header {
+            payload_length: l4.len() as u16,
+            next_header: next,
+            hop_limit: 64,
+            source: src,
+            destination: dst,
+            ..etherparse::Ipv6Header::default()
+        };
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&ip.to_bytes());
+        packet.extend_from_slice(l4);
+        parse_ipv6(&packet)
+    }
+
+    /// DHCP Discover: cookie и опция 53 подтверждают ярлык, в строке есть тип.
+    #[test]
+    fn udp_dhcp4_discover() {
+        let data = ipv4_udp(68, 67, &dhcp4_with_options(&[53, 1, 1, 255]));
+        match data.l4.clone() {
+            common::IpL4::Udp { app: common::UdpApp::Dhcp4, msg: Some(common::UdpMsg::Dhcp4 { msg: Some(common::Dhcp4Msg::Discover) }), .. } => {}
+            other => panic!("expected DHCP Discover, got {other:?}"),
+        }
+        assert!(format!("{}", data).contains("UDP/DHCP Discover"));
+    }
+
+    /// Порты 68/67 без magic cookie — не DHCP.
+    #[test]
+    fn udp_dhcp4_without_cookie_is_other() {
+        let data = ipv4_udp(68, 67, &[0u8; 240]);
+        match data.l4.clone() {
+            common::IpL4::Udp { app: common::UdpApp::Other, msg: None, .. } => {}
+            other => panic!("expected plain UDP, got {other:?}"),
+        }
+    }
+
+    /// Cookie есть, опции 53 нет: ярлык DHCP остаётся, тип не выдумывается.
+    #[test]
+    fn udp_dhcp4_cookie_without_msg_type() {
+        let data = ipv4_udp(67, 68, &dhcp4_with_options(&[]));
+        match data.l4.clone() {
+            common::IpL4::Udp { app: common::UdpApp::Dhcp4, msg: Some(common::UdpMsg::Dhcp4 { msg: None }), .. } => {}
+            other => panic!("expected DHCP without type, got {other:?}"),
+        }
+    }
+
+    /// Опция 53 находится после pad и другой опции.
+    #[test]
+    fn udp_dhcp4_request_after_other_option() {
+        let data = ipv4_udp(68, 67, &dhcp4_with_options(&[
+            0, 12, 5, b'h', b'o', b's', b't', b'1', 53, 1, 3, 255,
+        ]));
+        match data.l4.clone() {
+            common::IpL4::Udp { msg: Some(common::UdpMsg::Dhcp4 { msg: Some(common::Dhcp4Msg::Request) }), .. } => {}
+            other => panic!("expected DHCP Request, got {other:?}"),
+        }
+    }
+
+    /// DNS: первое имя вопроса попадает в строку.
+    #[test]
+    fn udp_dns() {
+        let data = ipv4_udp(12345, 53, &dns_query("example.com"));
+        match data.l4.clone() {
+            common::IpL4::Udp { app: common::UdpApp::Dns, msg: Some(common::UdpMsg::Query(name)), .. } => {
+                assert_eq!(name.as_str(), "example.com");
+            }
+            other => panic!("expected query name, got {other:?}"),
+        }
+        assert!(format!("{}", data).contains("UDP/DNS q=example.com"));
+    }
+
+    /// Короткий хвост на порту 53 — не DNS.
+    #[test]
+    fn udp_dns_too_short_is_other() {
+        let data = ipv4_udp(12345, 53, &[0, 1, 2, 3]);
+        match data.l4.clone() {
+            common::IpL4::Udp { app: common::UdpApp::Other, .. } => {}
+            other => panic!("expected plain UDP, got {other:?}"),
+        }
+    }
+
+    /// Указатель в имени вопроса собирается в одно имя.
+    #[test]
+    fn udp_dns_compressed_qname() {
+        let mut body = vec![0u8; 12];
+        body[5] = 1;
+        body.extend_from_slice(&[3, b'w', b'w', b'w', 0xC0, 22]);
+        body.extend_from_slice(&[0, 1, 0, 1]);
+        body.extend_from_slice(&[7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0]);
+        let data = ipv4_udp(5355, 5355, &body);
+        match data.l4.clone() {
+            common::IpL4::Udp { app: common::UdpApp::Llmnr, msg: Some(common::UdpMsg::Query(name)), .. } => {
+                assert_eq!(name.as_str(), "www.example.com");
+            }
+            other => panic!("expected compressed name, got {other:?}"),
+        }
+    }
+
+    /// Цикл указателя снимает ярлык DNS.
+    #[test]
+    fn udp_dns_pointer_loop_is_other() {
+        let mut body = dns_query("example.com");
+        body[12] = 0xC0;
+        body[13] = 12;
+        let data = ipv4_udp(53, 53, &body);
+        match data.l4.clone() {
+            common::IpL4::Udp { app: common::UdpApp::Other, .. } => {}
+            other => panic!("expected plain UDP, got {other:?}"),
+        }
+    }
+
+    /// mDNS 5353 важнее DNS 53, имя вопроса при этом читается.
+    #[test]
+    fn udp_mdns_beats_dns() {
+        let data = ipv4_udp(53, 5353, &dns_query("printer.local"));
+        match data.l4.clone() {
+            common::IpL4::Udp { app: common::UdpApp::Mdns, msg: Some(common::UdpMsg::Query(name)), .. } => {
+                assert_eq!(name.as_str(), "printer.local");
+            }
+            other => panic!("expected mDNS name, got {other:?}"),
+        }
+    }
+
+    /// Неизвестный порт остаётся Other, Display без суффикса приложения.
+    #[test]
+    fn udp_other_keeps_plain_udp() {
+        let data = ipv4_udp_ports(3456, 80);
+        match data.l4.clone() {
+            common::IpL4::Udp { app: common::UdpApp::Other, .. } => {}
+            other => panic!("expected plain UDP, got {other:?}"),
+        }
+        let s = format!("{}", data);
+        assert!(!s.contains("UDP/"));
+    }
+
+    /// ICMPv6 Echo Request: id и seq из заголовка.
+    #[test]
+    fn ipv6_icmp_echo_request() {
+        let echo = etherparse::Icmpv6Header::new(etherparse::Icmpv6Type::EchoRequest(
+            etherparse::IcmpEchoHeader { id: 7, seq: 9 },
+        ));
+        let data = expect_ip(ipv6_l4(etherparse::IpNumber::IPV6_ICMP, &echo.to_bytes()));
+        match data.l4.clone() {
+            common::IpL4::Icmp6(common::Icmp6Data::EchoRequest { id, seq }) => {
+                assert_eq!(id, 7);
+                assert_eq!(seq, 9);
+            }
+            other => panic!("expected EchoRequest, got {other:?}"),
+        }
+    }
+
+    /// Neighbor Solicitation: target из 16 байт после заголовка.
+    #[test]
+    fn ipv6_icmp_neighbor_solicitation() {
+        let target = common::Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 2);
+        let hdr = etherparse::Icmpv6Header::new(etherparse::Icmpv6Type::NeighborSolicitation);
+        let mut icmp = Vec::from(hdr.to_bytes().as_slice());
+        icmp.extend_from_slice(&target.octets());
+        let data = expect_ip(ipv6_l4(etherparse::IpNumber::IPV6_ICMP, &icmp));
+        match data.l4.clone() {
+            common::IpL4::Icmp6(common::Icmp6Data::NeighborSolicitation { target: t }) => assert_eq!(t, target),
+            other => panic!("expected NS, got {other:?}"),
+        }
+    }
+
+    /// Router Advertisement без options: hop limit, флаги M/O, lifetime.
+    #[test]
+    fn ipv6_icmp_router_advertisement() {
+        let ra = etherparse::icmpv6::RouterAdvertisementHeader {
+            cur_hop_limit: 64,
+            managed_address_config: true,
+            other_config: false,
+            router_lifetime: 1800,
+        };
+        let hdr = etherparse::Icmpv6Header::new(etherparse::Icmpv6Type::RouterAdvertisement(ra));
+        let data = expect_ip(ipv6_l4(etherparse::IpNumber::IPV6_ICMP, &hdr.to_bytes()));
+        match data.l4.clone() {
+            common::IpL4::Icmp6(common::Icmp6Data::RouterAdvertisement { hop_limit, managed, other_config, lifetime }) => {
+                assert_eq!(hop_limit, 64);
+                assert!(managed);
+                assert!(!other_config);
+                assert_eq!(lifetime, 1800);
+            }
+            other => panic!("expected RA, got {other:?}"),
+        }
+    }
+
+    /// MLD Query: тип 130, группа в хвосте.
+    #[test]
+    fn ipv6_icmp_mld_query() {
+        let group = common::Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
+        let mut icmp = vec![130, 0, 0, 0, 0x03, 0xe8, 0, 0];
+        icmp.extend_from_slice(&group.octets());
+        let data = expect_ip(ipv6_l4(etherparse::IpNumber::IPV6_ICMP, &icmp));
+        match data.l4.clone() {
+            common::IpL4::Icmp6(common::Icmp6Data::MldQuery { max_resp_delay, group: g }) => {
+                assert_eq!(max_resp_delay, 1000);
+                assert_eq!(g, group);
+            }
+            other => panic!("expected MLD Query, got {other:?}"),
+        }
+    }
+
+    /// Neighbor Solicitation без target — Icmp6_Broken с типом NS.
+    #[test]
+    fn ipv6_icmp_ns_truncated() {
+        let hdr = etherparse::Icmpv6Header::new(etherparse::Icmpv6Type::NeighborSolicitation);
+        match ipv6_l4(etherparse::IpNumber::IPV6_ICMP, &hdr.to_bytes()) {
+            Err(common::ParseError::Icmp6_Broken { icmp6_type: common::Icmp6Type::NeighborSolicitation, .. }) => {}
+            Err(e) => panic!("expected Icmp6_Broken NS, got {e:?}"),
+            Ok(_) => panic!("expected Icmp6_Broken"),
+        }
+    }
+
+    /// ESP (протокол 50): SPI из первых 4 байт, длина всего payload, хвост не читается.
+    #[test]
+    fn ipv4_esp_keeps_spi_and_length() {
+        let ip = etherparse::Ipv4Header::new(
+            16, 64, etherparse::IpNumber::ENCAPSULATING_SECURITY_PAYLOAD, [10, 0, 0, 1], [10, 0, 0, 2],
+        ).unwrap();
+        let mut esp = vec![0x01, 0x02, 0x03, 0x04, 0x00, 0x00, 0x00, 0x01];
+        esp.extend_from_slice(&[0xAA; 8]);
+
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&ip.to_bytes());
+        packet.extend_from_slice(&esp);
+
+        let data = expect_ip(parse_ipv4(&packet));
+        assert_eq!(data.len, 16);
+        assert_eq!(data.l4, common::IpL4::Esp(common::EspData { spi: 0x0102_0304 }));
+        let s = format!("{}", data);
+        assert!(s.contains("SPI=0x01020304"));
+        assert!(s.contains("ESP"));
+    }
+
+    /// ESP короче SPI+sequence — Esp_Broken, SPI не выдумывается.
+    #[test]
+    fn ipv4_esp_too_short() {
+        let ip = etherparse::Ipv4Header::new(
+            4, 64, etherparse::IpNumber::ENCAPSULATING_SECURITY_PAYLOAD, [10, 0, 0, 1], [10, 0, 0, 2],
+        ).unwrap();
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&ip.to_bytes());
+        packet.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]);
+
+        match parse_ipv4(&packet) {
+            Err(common::ParseError::Esp_Broken { len: 4, .. }) => {}
+            Err(e) => panic!("expected Esp_Broken, got {e:?}"),
+            Ok(_) => panic!("expected Esp_Broken"),
+        }
+    }
+
+    /// UDP/4500 остаётся EspOverUdp, а не протоколом 50.
+    #[test]
+    fn udp_4500_is_esp_over_udp() {
+        let data = ipv4_udp_ports(4500, 40000);
+        assert!(matches!(data.l4, common::IpL4::Udp { app: common::UdpApp::EspOverUdp, msg: None, .. }));
+    }
+
+    fn ipv4_icmp(icmp: &[u8]) -> Result<common::NetPayload, common::ParseError> {
+        let ip = etherparse::Ipv4Header::new(
+            icmp.len() as u16, 64, etherparse::IpNumber::ICMP, [10, 0, 0, 1], [10, 0, 0, 2],
+        ).unwrap();
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&ip.to_bytes());
+        packet.extend_from_slice(icmp);
+        parse_ipv4(&packet)
+    }
+
+    /// ICMPv4 Echo Request: id и seq из заголовка.
+    #[test]
+    fn ipv4_icmp_echo_request() {
+        let hdr = etherparse::Icmpv4Header::new(etherparse::Icmpv4Type::EchoRequest(
+            etherparse::IcmpEchoHeader { id: 7, seq: 9 },
+        ));
+        let data = expect_ip(ipv4_icmp(&hdr.to_bytes()));
+        match data.l4.clone() {
+            common::IpL4::Icmp4(common::Icmp4Data::EchoRequest { id, seq }) => {
+                assert_eq!(id, 7);
+                assert_eq!(seq, 9);
+            }
+            other => panic!("expected EchoRequest, got {other:?}"),
+        }
+        let s = format!("{}", data);
+        assert!(s.contains("ICMPv4"));
+        assert!(s.contains("Echo Request id=7 seq=9"));
+    }
+
+    /// Dest Unreach code 4 несёт next-hop MTU. Вложенный IP не читается.
+    #[test]
+    fn ipv4_icmp_dest_unreach_mtu() {
+        let hdr = etherparse::Icmpv4Header::new(etherparse::Icmpv4Type::DestinationUnreachable(
+            etherparse::icmpv4::DestUnreachableHeader::FragmentationNeeded { next_hop_mtu: 1500 },
+        ));
+        let mut icmp = Vec::from(hdr.to_bytes().as_slice());
+        icmp.extend_from_slice(&[0x45, 0x00, 0x00, 0x14]);
+        let data = expect_ip(ipv4_icmp(&icmp));
+        match data.l4.clone() {
+            common::IpL4::Icmp4(common::Icmp4Data::DestUnreach { code, mtu }) => {
+                assert_eq!(code, 4);
+                assert_eq!(mtu, Some(1500));
+            }
+            other => panic!("expected DestUnreach, got {other:?}"),
+        }
+    }
+
+    /// Redirect: код и gateway IPv4.
+    #[test]
+    fn ipv4_icmp_redirect() {
+        let hdr = etherparse::Icmpv4Header::new(etherparse::Icmpv4Type::Redirect(
+            etherparse::icmpv4::RedirectHeader {
+                code: etherparse::icmpv4::RedirectCode::RedirectForHost,
+                gateway_internet_address: [192, 168, 1, 1],
+            },
+        ));
+        let data = expect_ip(ipv4_icmp(&hdr.to_bytes()));
+        match data.l4.clone() {
+            common::IpL4::Icmp4(common::Icmp4Data::Redirect { code, gateway }) => {
+                assert_eq!(code, 1);
+                assert_eq!(gateway, common::Ipv4Addr::new(192, 168, 1, 1));
+            }
+            other => panic!("expected Redirect, got {other:?}"),
+        }
+    }
+
+    /// Timestamp ровно 20 байт: id, seq и три метки.
+    #[test]
+    fn ipv4_icmp_timestamp() {
+        let hdr = etherparse::Icmpv4Header::new(etherparse::Icmpv4Type::TimestampRequest(
+            etherparse::icmpv4::TimestampMessage {
+                id: 1,
+                seq: 2,
+                originate_timestamp: 10,
+                receive_timestamp: 20,
+                transmit_timestamp: 30,
+            },
+        ));
+        let bytes = hdr.to_bytes();
+        assert_eq!(bytes.len(), 20);
+        let data = expect_ip(ipv4_icmp(&bytes));
+        match data.l4.clone() {
+            common::IpL4::Icmp4(common::Icmp4Data::Timestamp { id, seq, originate, receive, transmit }) => {
+                assert_eq!(id, 1);
+                assert_eq!(seq, 2);
+                assert_eq!(originate, 10);
+                assert_eq!(receive, 20);
+                assert_eq!(transmit, 30);
+            }
+            other => panic!("expected Timestamp, got {other:?}"),
+        }
+    }
+
+    /// Router Advertisement: etherparse отдаёт Unknown, поля берутся из bytes5to8.
+    #[test]
+    fn ipv4_icmp_router_advertisement() {
+        let hdr = etherparse::Icmpv4Header::new(etherparse::Icmpv4Type::Unknown {
+            type_u8: common::ICMP4_TYPE_RA,
+            code_u8: 0,
+            bytes5to8: [2, 2, 0x00, 0xB4],
+        });
+        let data = expect_ip(ipv4_icmp(&hdr.to_bytes()));
+        match data.l4.clone() {
+            common::IpL4::Icmp4(common::Icmp4Data::RouterAdvertisement { num_addrs, addr_entry_size, lifetime }) => {
+                assert_eq!(num_addrs, 2);
+                assert_eq!(addr_entry_size, 2);
+                assert_eq!(lifetime, 180);
+            }
+            other => panic!("expected RA, got {other:?}"),
+        }
+    }
+
+    /// Echo короче 8 байт — Icmp4_Broken с типом EchoRequest.
+    #[test]
+    fn ipv4_icmp_echo_truncated() {
+        match ipv4_icmp(&[8, 0, 0, 0]) {
+            Err(common::ParseError::Icmp4_Broken { icmp4_type: common::Icmp4Type::EchoRequest, len: 4, .. }) => {}
+            Err(e) => panic!("expected Icmp4_Broken EchoRequest, got {e:?}"),
+            Ok(_) => panic!("expected Icmp4_Broken"),
+        }
+    }
+
+    /// Timestamp не из 20 байт etherparse не принимает: Icmp4_Broken с типом Timestamp.
+    #[test]
+    fn ipv4_icmp_timestamp_wrong_length() {
+        match ipv4_icmp(&[13, 0, 0, 0, 0, 0, 0, 0]) {
+            Err(common::ParseError::Icmp4_Broken { icmp4_type: common::Icmp4Type::Timestamp, .. }) => {}
+            Err(e) => panic!("expected Icmp4_Broken Timestamp, got {e:?}"),
+            Ok(_) => panic!("expected Icmp4_Broken"),
+        }
+    }
+
+    /// Неизвестный тип остаётся Unknown, пакет не ошибка.
+    #[test]
+    fn ipv4_icmp_unknown_type() {
+        let hdr = etherparse::Icmpv4Header::new(etherparse::Icmpv4Type::Unknown {
+            type_u8: 99,
+            code_u8: 1,
+            bytes5to8: [0, 0, 0, 0],
+        });
+        let data = expect_ip(ipv4_icmp(&hdr.to_bytes()));
+        assert_eq!(data.l4, common::IpL4::Icmp4(common::Icmp4Data::Unknown { type_u8: 99, code: 1 }));
     }
 }

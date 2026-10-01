@@ -48,6 +48,7 @@ use tracing_subscriber;
 }*/
 
 static SOCKET_PATH: &str = "/tmp/net_listener_stats2.sock";
+/// Unix-сокет для отдачи статистики наружу. При Drop файл сокета удаляется.
 struct MainChannels {
     uds           : UnixDatagram,
 }

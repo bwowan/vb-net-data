@@ -54,7 +54,7 @@ pub fn capture_loop(
                 match sender.try_send(cap_data) {
                     Ok(_) => {}
                     Err(flume::TrySendError::Full(_)) => {
-                        warn!("CAP: buffer full, dropping packet");
+                        //warn!("CAP: buffer full, dropping packet");
                     }
                     Err(flume::TrySendError::Disconnected(_)) => {
                         info!("Receivers dropped, stopping capture loop on device {}", device_name);
