@@ -53,14 +53,14 @@ impl fmt::Display for IpType {
 impl fmt::Display for IgmpType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            IgmpType::Query      => write!(f, "IGMP Query"),
-            IgmpType::V1Query    => write!(f, "IGMPv1 Query"),
-            IgmpType::V1Report   => write!(f, "IGMPv1 Report"),
-            IgmpType::V2Query    => write!(f, "IGMPv2 Query"),
-            IgmpType::V2Report   => write!(f, "IGMPv2 Report"),
-            IgmpType::V2Leave    => write!(f, "IGMPv2 Leave"),
-            IgmpType::V3Query    => write!(f, "IGMPv3 Query"),
-            IgmpType::V3Report   => write!(f, "IGMPv3 Report"),
+            IgmpType::Query           => write!(f, "IGMP Query"),
+            IgmpType::V1Query         => write!(f, "IGMPv1 Query"),
+            IgmpType::V1Report        => write!(f, "IGMPv1 Report"),
+            IgmpType::V2Query         => write!(f, "IGMPv2 Query"),
+            IgmpType::V2Report        => write!(f, "IGMPv2 Report"),
+            IgmpType::V2Leave         => write!(f, "IGMPv2 Leave"),
+            IgmpType::V3Query         => write!(f, "IGMPv3 Query"),
+            IgmpType::V3Report        => write!(f, "IGMPv3 Report"),
             IgmpType::Unknown(t) => write!(f, "IGMP type 0x{:02x}", t),
         }
     }
@@ -75,7 +75,7 @@ impl fmt::Display for IgmpV3RecordType {
             IgmpV3RecordType::ChangeToExclude => write!(f, "CHANGE_TO_EXCLUDE"),
             IgmpV3RecordType::AllowNewSources => write!(f, "ALLOW_NEW_SOURCES"),
             IgmpV3RecordType::BlockOldSources => write!(f, "BLOCK_OLD_SOURCES"),
-            IgmpV3RecordType::Unknown(t)      => write!(f, "record 0x{:02x}", t),
+            IgmpV3RecordType::Unknown(t) => write!(f, "record 0x{:02x}", t),
         }
     }
 }
@@ -83,12 +83,12 @@ impl fmt::Display for IgmpV3RecordType {
 impl fmt::Display for IgmpData {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            IgmpData::V1Query(v)  => write!(f, "IGMPv1 Query group={}", v.group),
-            IgmpData::V1Report(v) => write!(f, "IGMPv1 Report group={}", v.group),
-            IgmpData::V2Query(v)  => write!(f, "IGMPv2 Query group={} max_resp={}", v.group, v.max_resp_time),
-            IgmpData::V2Report(v) => write!(f, "IGMPv2 Report group={}", v.group),
-            IgmpData::V2Leave(v)  => write!(f, "IGMPv2 Leave group={}", v.group),
-            IgmpData::V3Query(v)  => write!(
+            IgmpData::V1Query(v)        => write!(f, "IGMPv1 Query group={}", v.group),
+            IgmpData::V1Report(v)       => write!(f, "IGMPv1 Report group={}", v.group),
+            IgmpData::V2Query(v)        => write!(f, "IGMPv2 Query group={} max_resp={}", v.group, v.max_resp_time),
+            IgmpData::V2Report(v)       => write!(f, "IGMPv2 Report group={}", v.group),
+            IgmpData::V2Leave(v)        => write!(f, "IGMPv2 Leave group={}", v.group),
+            IgmpData::V3Query(v)   => write!(
                 f, "IGMPv3 Query group={} sources={} S={} QRV={} QQIC={}",
                 v.group, v.sources.len(), v.suppress_router_processing, v.qrv, v.qqic
             ),
@@ -119,6 +119,79 @@ impl fmt::Display for Dhcp4Msg {
     }
 }
 
+impl fmt::Display for Dhcp6Msg {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Dhcp6Msg::Solicit            => write!(f, "Solicit"),
+            Dhcp6Msg::Advertise          => write!(f, "Advertise"),
+            Dhcp6Msg::Request            => write!(f, "Request"),
+            Dhcp6Msg::Confirm            => write!(f, "Confirm"),
+            Dhcp6Msg::Renew              => write!(f, "Renew"),
+            Dhcp6Msg::Rebind             => write!(f, "Rebind"),
+            Dhcp6Msg::Reply              => write!(f, "Reply"),
+            Dhcp6Msg::Release            => write!(f, "Release"),
+            Dhcp6Msg::Decline            => write!(f, "Decline"),
+            Dhcp6Msg::Reconfigure        => write!(f, "Reconfigure"),
+            Dhcp6Msg::InformationRequest => write!(f, "Information-Request"),
+            Dhcp6Msg::RelayForw          => write!(f, "Relay-forward"),
+            Dhcp6Msg::RelayRepl          => write!(f, "Relay-reply"),
+        }
+    }
+}
+
+impl fmt::Display for NbnsOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            NbnsOp::Query         => write!(f, "Query"),
+            NbnsOp::Registration  => write!(f, "Registration"),
+            NbnsOp::Release       => write!(f, "Release"),
+            NbnsOp::Wack          => write!(f, "WACK"),
+            NbnsOp::Refresh       => write!(f, "Refresh"),
+            NbnsOp::Other(c) => write!(f, "op {}", c),
+        }
+    }
+}
+
+impl fmt::Display for NbnsMsg {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.response {
+            write!(f, "Response")?;
+        } else {
+            write!(f, "{}", self.op)?;
+        }
+        write!(f, " ")?;
+        if !self.name.is_empty() {
+            write!(f, "{} ", self.name)?;
+        }
+        write!(f, "<{:02X}>", self.suffix)?;
+        if self.kind == NbnsKind::NbStat {
+            write!(f, " NBSTAT")?;
+        }
+        if let Some(addr) = self.addr {
+            write!(f, " {}", addr)?;
+        }
+        if self.response && self.rcode != 0 {
+            write!(f, " rcode={}", self.rcode)?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for DnsQuery {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(name) = &self.name {
+            write!(f, "q={}", name)?;
+        }
+        if let Some(srv) = &self.srv {
+            if self.name.is_some() {
+                write!(f, " ")?;
+            }
+            write!(f, "SRV port={} host={}", srv.port, srv.host)?;
+        }
+        Ok(())
+    }
+}
+
 impl fmt::Display for UdpApp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -128,6 +201,7 @@ impl fmt::Display for UdpApp {
             UdpApp::Mdns       => write!(f, "mDNS"),
             UdpApp::Ssdp       => write!(f, "SSDP"),
             UdpApp::Llmnr      => write!(f, "LLMNR"),
+            UdpApp::Nbns       => write!(f, "NBNS"),
             UdpApp::Ntp        => write!(f, "NTP"),
             UdpApp::Quic       => write!(f, "QUIC"),
             UdpApp::Wireguard  => write!(f, "WireGuard"),
@@ -216,10 +290,20 @@ impl fmt::Display for Icmp6Data {
             Icmp6Data::RouterAdvertisement { hop_limit, managed, other_config, lifetime } => write!(
                 f, "Router Advertisement hop={} M={} O={} lifetime={}", hop_limit, managed, other_config, lifetime
             ),
-            Icmp6Data::NeighborSolicitation { target } => write!(f, "Neighbor Solicitation target={}", target),
-            Icmp6Data::NeighborAdvertisement { router, solicited, override_flag, target } => write!(
-                f, "Neighbor Advertisement target={} R={} S={} O={}", target, router, solicited, override_flag
-            ),
+            Icmp6Data::NeighborSolicitation { target, lladdr } => match lladdr {
+                Some(mac) => write!(f, "Neighbor Solicitation target={} lladdr={}", target, mac),
+                None => write!(f, "Neighbor Solicitation target={}", target),
+            },
+            Icmp6Data::NeighborAdvertisement { router, solicited, override_flag, target, lladdr } => match lladdr {
+                Some(mac) => write!(
+                    f, "Neighbor Advertisement target={} R={} S={} O={} lladdr={}",
+                    target, router, solicited, override_flag, mac
+                ),
+                None => write!(
+                    f, "Neighbor Advertisement target={} R={} S={} O={}",
+                    target, router, solicited, override_flag
+                ),
+            },
             Icmp6Data::Redirect { target, destination } => write!(
                 f, "Redirect target={} dest={}", target, destination
             ),
@@ -298,10 +382,10 @@ impl fmt::Display for EthData {
 impl fmt::Display for ArpOp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ArpOp::Request     => write!(f, "Request"),
-            ArpOp::Reply       => write!(f, "Reply"),
-            ArpOp::RarpRequest => write!(f, "RARP Request"),
-            ArpOp::RarpReply   => write!(f, "RARP Reply"),
+            ArpOp::Request           => write!(f, "Request"),
+            ArpOp::Reply             => write!(f, "Reply"),
+            ArpOp::RarpRequest       => write!(f, "RARP Request"),
+            ArpOp::RarpReply         => write!(f, "RARP Reply"),
             ArpOp::Unknown(id) => write!(f, "Unknown({})", id),
         }
     }
@@ -334,14 +418,50 @@ impl fmt::Display for IpData {
             IpL4::Esp(esp) => write!(f, "IP[{}({}bytes), src:{} --> dst:{}, {}]",
                 IpType::Esp, self.len, self.src, self.dst, esp),
             IpL4::Udp { src_port, dst_port, app, msg } if *app != UdpApp::Other => match msg {
-                Some(UdpMsg::Query(name)) => write!(
-                    f, "IP[UDP/{} q={}({}bytes), src:{}:{} --> dst:{}:{}]",
-                    app, name, self.len, self.src, src_port, self.dst, dst_port
-                ),
-                Some(UdpMsg::Dhcp4 { msg: Some(m) }) => write!(
+                Some(UdpMsg::Query(q)) => write!(
                     f, "IP[UDP/{} {}({}bytes), src:{}:{} --> dst:{}:{}]",
-                    app, m, self.len, self.src, src_port, self.dst, dst_port
+                    app, q, self.len, self.src, src_port, self.dst, dst_port
                 ),
+                Some(UdpMsg::Dhcp4 { msg, host, requested }) => {
+                    write!(f, "IP[UDP/{}", app)?;
+                    if let Some(m) = msg {
+                        write!(f, " {}", m)?;
+                    }
+                    if let Some(h) = host {
+                        write!(f, " host={}", h)?;
+                    }
+                    if let Some(ip) = requested {
+                        write!(f, " req={}", ip)?;
+                    }
+                    write!(
+                        f, "({}bytes), src:{}:{} --> dst:{}:{}",
+                        self.len, self.src, src_port, self.dst, dst_port
+                    )
+                }
+                Some(UdpMsg::Nbns(n)) => write!(
+                    f, "IP[UDP/{} {}({}bytes), src:{}:{} --> dst:{}:{}]",
+                    app, n, self.len, self.src, src_port, self.dst, dst_port
+                ),
+                Some(UdpMsg::Dhcp6 { msg }) => write!(
+                    f, "IP[UDP/{} {}({}bytes), src:{}:{} --> dst:{}:{}]",
+                    app, msg, self.len, self.src, src_port, self.dst, dst_port
+                ),
+                Some(UdpMsg::Ssdp(s)) => {
+                    write!(f, "IP[UDP/{} {}", app, s.start)?;
+                    if let Some(nt) = &s.nt {
+                        write!(f, " NT={}", nt)?;
+                    }
+                    if let Some(usn) = &s.usn {
+                        write!(f, " USN={}", usn)?;
+                    }
+                    if let Some(loc) = &s.location {
+                        write!(f, " LOCATION={}", loc)?;
+                    }
+                    write!(
+                        f, "({}bytes), src:{}:{} --> dst:{}:{}",
+                        self.len, self.src, src_port, self.dst, dst_port
+                    )
+                }
                 _ => write!(f, "IP[UDP/{}({}bytes), src:{}:{} --> dst:{}:{}]",
                     app, self.len, self.src, src_port, self.dst, dst_port),
             },

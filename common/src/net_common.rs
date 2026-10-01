@@ -10,7 +10,7 @@ pub struct CapData {
 
 pub const MAC_ADDRESS_LEN6:usize = 6;
 /// 48-битный MAC (Ethernet). Сравнивается с адресом своего интерфейса, чтобы выставить направление.
-#[derive(Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
 pub struct MacAddr6(pub [u8; MAC_ADDRESS_LEN6]);
 
 //broadcats templates
@@ -286,6 +286,7 @@ pub enum UdpApp {
     Mdns,
     Ssdp,
     Llmnr,
+    Nbns,
     Ntp,
     Quic,
     Wireguard,
@@ -296,6 +297,12 @@ pub enum UdpApp {
 
 /// Сколько символов имени DNS сохраняем. Хвост длиннее обрезается, пакет остаётся DNS.
 pub const UDP_QNAME_MAX: usize = 64;
+
+/// Имя NetBIOS без суффикса: 15 байт, хвостовые пробелы уже убраны.
+pub const NBNS_NAME_MAX: usize = 15;
+
+/// Сколько символов строки SSDP сохраняем. Хвост длиннее обрезается, пакет остаётся SSDP.
+pub const UDP_SSDP_MAX: usize = 128;
 
 /// Тип сообщения DHCP (опция 53, RFC 2132).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -311,13 +318,99 @@ pub enum Dhcp4Msg {
     Other(u8),
 }
 
+/// Тип сообщения DHCPv6 (первый байт, RFC 8415). Неизвестный тип пакет не подтверждает.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Dhcp6Msg {
+    Solicit,            // 1
+    Advertise,          // 2
+    Request,            // 3
+    Confirm,            // 4
+    Renew,              // 5
+    Rebind,             // 6
+    Reply,              // 7
+    Release,            // 8
+    Decline,            // 9
+    Reconfigure,        // 10
+    InformationRequest, // 11
+    RelayForw,          // 12
+    RelayRepl,          // 13
+}
+
+/// Порт и целевой хост записи SRV (RFC 2782). Приоритет и вес не сохраняются.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct SrvHost {
+    pub port: u16,
+    pub host: heapless::String<UDP_QNAME_MAX>,
+}
+
+/// Код операции NBNS, биты 14–11 флагового слова (RFC 1002).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NbnsOp {
+    Query,        // 0
+    Registration, // 5
+    Release,      // 6
+    Wack,         // 7
+    Refresh,      // 8
+    Other(u8),
+}
+
+/// Тип вопроса NBNS: имя или статус узла.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NbnsKind {
+    Nb,     // 0x0020
+    NbStat, // 0x0021
+}
+
+/// Один пакет NBNS. Запрос и ответ не связываются: направление — адреса IP-пакета.
+/// `addr` — IPv4 первой целой NB-записи ответа. Статистика NBSTAT не читается.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct NbnsMsg {
+    pub response: bool,
+    pub op: NbnsOp,
+    pub name: heapless::String<NBNS_NAME_MAX>,
+    pub suffix: u8,
+    pub kind: NbnsKind,
+    pub rcode: u8,
+    pub addr: Option<Ipv4Addr>,
+}
+
+/// DNS, mDNS или LLMNR.
+/// `name` — первое имя вопроса, если вопросы есть.
+/// `srv` — порт и хост первой записи SRV в ответах.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct DnsQuery {
+    pub name: Option<heapless::String<UDP_QNAME_MAX>>,
+    pub srv: Option<SrvHost>,
+}
+
 /// Что удалось прочитать из тела UDP. Ярлык `UdpApp` при этом уже подтверждён.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum UdpMsg {
-    /// Первое имя вопроса DNS, mDNS или LLMNR.
-    Query(heapless::String<UDP_QNAME_MAX>),
-    /// DHCP: magic cookie совпал. `msg` — опция 53, если она есть в срезе.
-    Dhcp4 { msg: Option<Dhcp4Msg> },
+    /// Имя вопроса и, если в ответах есть SRV, её порт и хост.
+    Query(DnsQuery),
+    /// DHCPv6: первый байт — известный тип, длина заголовка достаточная.
+    Dhcp6 { msg: Dhcp6Msg },
+    /// DHCP: magic cookie совпал.
+    /// `msg` — опция 53, `host` — опция 12 (не длиннее `UDP_QNAME_MAX`), `requested` — опция 50.
+    Dhcp4 {
+        msg: Option<Dhcp4Msg>,
+        host: Option<heapless::String<UDP_QNAME_MAX>>,
+        requested: Option<Ipv4Addr>,
+    },
+    /// SSDP: первая строка и заголовки NT, USN, LOCATION.
+    Ssdp(SsdpMsg),
+    /// NBNS: имя из 32 символов A–P подтвердило пакет.
+    Nbns(NbnsMsg),
+}
+
+/// SSDP (UPnP, UDP/1900). Первая строка — M-SEARCH, NOTIFY или HTTP/1.x.
+/// `nt`, `usn`, `location` — одноимённые заголовки, если они есть. Остальные не читаются.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct SsdpMsg {
+    pub start: heapless::String<UDP_SSDP_MAX>,
+    pub nt: Option<heapless::String<UDP_SSDP_MAX>>,
+    pub usn: Option<heapless::String<UDP_SSDP_MAX>>,
+    pub location: Option<heapless::String<UDP_SSDP_MAX>>,
 }
 
 // ── ICMPv4 (RFC 792, PMTU RFC 1191, Router Discovery RFC 1256) ──────────────
@@ -382,6 +475,8 @@ pub const ICMP6_TYPE_REDIRECT:       u8 = 137;
 pub const ICMP6_TYPE_MLDV2_REPORT:   u8 = 143;
 
 pub const ICMP6_NDP_TARGET_LEN: usize = 16;
+pub const ICMP6_NDP_OPT_SRC_LLADDR: u8 = 1; // Source Link-Layer Address: MAC спрашивающего в NS
+pub const ICMP6_NDP_OPT_TGT_LLADDR: u8 = 2; // Target Link-Layer Address: MAC объявляемого соседа в NA
 pub const ICMP6_MLD_MIN_LEN:    usize = 24; // type..reserved + 16-byte group
 pub const ICMP6_REDIRECT_MIN:   usize = 8 + 16 + 16;
 
@@ -406,7 +501,8 @@ pub enum Icmp6Type {
     Redirect,                  // 137   Redirect (перенаправление)
 }
 
-/// Разобранное ICMPv6-сообщение. NDP options и MLDv2 records не разбираются.
+/// Разобранное ICMPv6-сообщение.
+/// У NS читается Source LLA (тип 1), у NA — Target LLA (тип 2). Остальные NDP options и записи MLDv2 не разбираются.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Icmp6Data {
     EchoRequest { id: u16, seq: u16 },
@@ -417,8 +513,8 @@ pub enum Icmp6Data {
     ParamProblem { code: u8 },
     RouterSolicitation,
     RouterAdvertisement { hop_limit: u8, managed: bool, other_config: bool, lifetime: u16 },
-    NeighborSolicitation { target: Ipv6Addr },
-    NeighborAdvertisement { router: bool, solicited: bool, override_flag: bool, target: Ipv6Addr },
+    NeighborSolicitation { target: Ipv6Addr, lladdr: Option<MacAddr6> },
+    NeighborAdvertisement { router: bool, solicited: bool, override_flag: bool, target: Ipv6Addr, lladdr: Option<MacAddr6> },
     Redirect { target: Ipv6Addr, destination: Ipv6Addr },
     MldQuery { max_resp_delay: u16, group: Ipv6Addr },
     MldReport { group: Ipv6Addr },

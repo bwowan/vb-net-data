@@ -315,17 +315,30 @@ fn udp_payload_slice(length: u16, rest: &[u8]) -> &[u8] {
     if declared <= rest.len() { &rest[..declared] } else { rest }
 }
 
-/// DNS/mDNS/LLMNR: первое имя вопроса. DHCP: magic cookie и опция 53.
+/// DNS/mDNS/LLMNR: первое имя вопроса и первая SRV в ответах. DHCP: magic cookie, опции 53, 12 и 50.
+/// DHCPv6: первый байт — тип. NBNS: имя из 32 символов A–P. SSDP: первая строка и заголовки NT, USN, LOCATION.
 /// Тело не сошлось — ярлык по порту снимается, пакет остаётся обычным UDP.
 fn confirm_udp_body(data: &mut common::IpData, body: &[u8]) {
     let common::IpL4::Udp { app, msg, .. } = &mut data.l4 else { return };
     match *app {
         common::UdpApp::Dhcp4 => match parse_dhcp4(body) {
-            Some(m) => *msg = Some(common::UdpMsg::Dhcp4 { msg: m }),
+            Some(parsed) => *msg = Some(parsed),
             None => *app = common::UdpApp::Other,
         },
-        common::UdpApp::Dns | common::UdpApp::Mdns | common::UdpApp::Llmnr => match parse_dns_qname(body) {
-            Ok(Some(name)) => *msg = Some(common::UdpMsg::Query(name)),
+        common::UdpApp::Dhcp6 => match parse_dhcp6(body) {
+            Some(parsed) => *msg = Some(parsed),
+            None => *app = common::UdpApp::Other,
+        },
+        common::UdpApp::Ssdp => match parse_ssdp(body) {
+            Some(parsed) => *msg = Some(parsed),
+            None => *app = common::UdpApp::Other,
+        },
+        common::UdpApp::Nbns => match parse_nbns(body) {
+            Some(parsed) => *msg = Some(parsed),
+            None => *app = common::UdpApp::Other,
+        },
+        common::UdpApp::Dns | common::UdpApp::Mdns | common::UdpApp::Llmnr => match parse_dns_msg(body) {
+            Ok(Some(q)) => *msg = Some(common::UdpMsg::Query(q)),
             Ok(None) => {}
             Err(()) => *app = common::UdpApp::Other,
         },
@@ -335,27 +348,94 @@ fn confirm_udp_body(data: &mut common::IpData, body: &[u8]) {
 
 const DNS_HEADER_LEN: usize = 12;
 const DNS_PTR_HOPS: usize = 8;
+const DNS_TYPE_SRV: u16 = 33;
+const DNS_SRV_FIXED: usize = 6; // priority, weight, port
+const NBNS_TYPE_NB: u16 = 0x0020;
+const NBNS_LABEL_LEN: usize = 32;
+const NBNS_RDATA_MIN: usize = 6; // flags + IPv4
 const DHCP4_COOKIE_AT: usize = 236;
 const DHCP4_OPTIONS_AT: usize = 240;
 const DHCP4_COOKIE: [u8; 4] = [0x63, 0x82, 0x53, 0x63];
+const DHCP4_OPT_HOST: u8 = 12;
+const DHCP4_OPT_REQ_ADDR: u8 = 50;
 const DHCP4_OPT_MSG_TYPE: u8 = 53;
 const DHCP4_OPT_END: u8 = 255;
 const DHCP4_OPT_PAD: u8 = 0;
+const DHCP6_MSG_MIN: usize = 4;   // type + transaction-id
+const DHCP6_RELAY_MIN: usize = 34; // type, hop-count, link-address, peer-address
 
-/// `Ok(None)` — заголовок DNS есть, вопросов нет. `Err` — это не DNS.
-fn parse_dns_qname(body: &[u8]) -> Result<Option<heapless::String<{ common::UDP_QNAME_MAX }>>, ()> {
+/// `Ok(None)` — заголовок есть, ни вопроса, ни целой SRV. `Err` — битое первое имя вопроса.
+/// Первая SRV в ответах: порт и целевой хост. Короче 7 байт или имя вне rdata — запись пропускается.
+/// Обрезанный ответ останавливает обход: уже прочитанный вопрос сохраняется, порт не выдумывается.
+fn parse_dns_msg(body: &[u8]) -> Result<Option<common::DnsQuery>, ()> {
     if body.len() < DNS_HEADER_LEN {
         return Err(());
     }
     let qd = u16::from_be_bytes([body[4], body[5]]);
-    if qd == 0 {
-        return Ok(None);
+    let an = u16::from_be_bytes([body[6], body[7]]);
+    let mut pos = DNS_HEADER_LEN;
+    let mut name = None;
+    if qd > 0 {
+        let (n, end) = read_dns_name(body, pos)?;
+        if end + 4 > body.len() {
+            return Err(());
+        }
+        name = Some(n);
+        pos = end + 4;
+        for _ in 1..qd {
+            let Some(next) = skip_dns_question(body, pos) else {
+                return Ok(Some(common::DnsQuery { name, srv: None }));
+            };
+            pos = next;
+        }
     }
-    let (name, end) = read_dns_name(body, DNS_HEADER_LEN)?;
-    if end + 4 > body.len() {
-        return Err(());
+    let srv = dns_first_srv(body, pos, an);
+    if name.is_none() && srv.is_none() {
+        Ok(None)
+    } else {
+        Ok(Some(common::DnsQuery { name, srv }))
     }
-    Ok(Some(name))
+}
+
+fn skip_dns_question(body: &[u8], pos: usize) -> Option<usize> {
+    let (_, end) = read_dns_name(body, pos).ok()?;
+    let next = end.checked_add(4)?;
+    if next > body.len() { None } else { Some(next) }
+}
+
+/// Первая целая SRV среди `an` записей с позиции `pos`. Приоритет и вес не читаются.
+fn dns_first_srv(body: &[u8], mut pos: usize, an: u16) -> Option<common::SrvHost> {
+    for _ in 0..an {
+        let (_, name_end) = read_dns_name(body, pos).ok()?;
+        if name_end + 10 > body.len() {
+            return None;
+        }
+        let rr_type = u16::from_be_bytes([body[name_end], body[name_end + 1]]);
+        let rdlen = u16::from_be_bytes([body[name_end + 8], body[name_end + 9]]) as usize;
+        let rdata = name_end + 10;
+        if rdata + rdlen > body.len() {
+            return None;
+        }
+        if rr_type == DNS_TYPE_SRV {
+            if let Some(srv) = parse_srv_rdata(body, rdata, rdlen) {
+                return Some(srv);
+            }
+        }
+        pos = rdata + rdlen;
+    }
+    None
+}
+
+fn parse_srv_rdata(body: &[u8], rdata: usize, rdlen: usize) -> Option<common::SrvHost> {
+    if rdlen < DNS_SRV_FIXED + 1 {
+        return None;
+    }
+    let port = u16::from_be_bytes([body[rdata + 4], body[rdata + 5]]);
+    let (host, end) = read_dns_name(body, rdata + DNS_SRV_FIXED).ok()?;
+    if end > rdata + rdlen {
+        return None;
+    }
+    Some(common::SrvHost { port, host })
 }
 
 /// Имя с позиции `pos`. Второе значение — где кончается имя на проводе, без учёта прыжков по указателям.
@@ -423,11 +503,16 @@ fn push_dns_label(out: &mut heapless::String<{ common::UDP_QNAME_MAX }>, label: 
     }
 }
 
-/// `Some(None)` — cookie есть, опции 53 в срезе нет. `None` — это не DHCP.
-fn parse_dhcp4(body: &[u8]) -> Option<Option<common::Dhcp4Msg>> {
+/// `Some` — cookie есть. `None` — это не DHCP.
+/// Опция 12 длиннее 64 символов обрезается. Опция 50 короче или длиннее 4 байт пропускается.
+/// Обрезанная опция останавливает обход: уже прочитанные поля сохраняются.
+fn parse_dhcp4(body: &[u8]) -> Option<common::UdpMsg> {
     if body.len() < DHCP4_OPTIONS_AT || body[DHCP4_COOKIE_AT..DHCP4_OPTIONS_AT] != DHCP4_COOKIE {
         return None;
     }
+    let mut msg = None;
+    let mut host = None;
+    let mut requested = None;
     let mut i = DHCP4_OPTIONS_AT;
     while i < body.len() {
         let code = body[i];
@@ -445,12 +530,328 @@ fn parse_dhcp4(body: &[u8]) -> Option<Option<common::Dhcp4Msg>> {
         if i + 2 + len > body.len() {
             break;
         }
-        if code == DHCP4_OPT_MSG_TYPE && len >= 1 {
-            return Some(Some(common::Dhcp4Msg::from_u8(body[i + 2])));
+        let value = &body[i + 2..i + 2 + len];
+        match code {
+            DHCP4_OPT_MSG_TYPE if msg.is_none() && !value.is_empty() => {
+                msg = Some(common::Dhcp4Msg::from_u8(value[0]));
+            }
+            DHCP4_OPT_HOST if host.is_none() && !value.is_empty() => {
+                host = Some(dhcp4_hostname(value));
+            }
+            DHCP4_OPT_REQ_ADDR if requested.is_none() && value.len() == 4 => {
+                requested = Some(common::Ipv4Addr::new(value[0], value[1], value[2], value[3]));
+            }
+            _ => {}
         }
         i += 2 + len;
     }
-    Some(None)
+    Some(common::UdpMsg::Dhcp4 { msg, host, requested })
+}
+
+/// `Some` — тип 1–11 и не короче 4 байт, либо relay 12–13 и не короче 34.
+/// `None` — это не DHCPv6. Transaction-id и опции не читаются.
+fn parse_dhcp6(body: &[u8]) -> Option<common::UdpMsg> {
+    let msg = common::Dhcp6Msg::from_u8(*body.first()?)?;
+    let min = if msg.is_relay() { DHCP6_RELAY_MIN } else { DHCP6_MSG_MIN };
+    if body.len() < min {
+        return None;
+    }
+    Some(common::UdpMsg::Dhcp6 { msg })
+}
+
+struct NbnsDecoded {
+    name: heapless::String<{ common::NBNS_NAME_MAX }>,
+    suffix: u8,
+}
+
+/// `Some` — первая метка из 32 символов A–P и тип NB или NBSTAT.
+/// `None` — это не NBNS. У ответа без вопросов имя берётся из первой записи.
+/// IPv4 — из первой целой NB-записи (6 байт). Короче или обрезанная адреса не даёт.
+fn parse_nbns(body: &[u8]) -> Option<common::UdpMsg> {
+    if body.len() < DNS_HEADER_LEN {
+        return None;
+    }
+    let flags = u16::from_be_bytes([body[2], body[3]]);
+    let response = flags & 0x8000 != 0;
+    let op = common::NbnsOp::from_u8(((flags >> 11) & 0x0F) as u8);
+    let rcode = (flags & 0x0F) as u8;
+    let qd = u16::from_be_bytes([body[4], body[5]]);
+    let an = u16::from_be_bytes([body[6], body[7]]);
+
+    let mut pos = DNS_HEADER_LEN;
+    let mut decoded = None;
+    let mut kind = None;
+    if qd > 0 {
+        let (name, end) = read_nbns_name(body, pos)?;
+        if end + 4 > body.len() {
+            return None;
+        }
+        kind = Some(common::NbnsKind::from_u16(u16::from_be_bytes([body[end], body[end + 1]]))?);
+        decoded = Some(name);
+        pos = end + 4;
+        for _ in 1..qd {
+            let Some(next) = skip_dns_question(body, pos) else {
+                let name = decoded.unwrap();
+                let kind = kind.unwrap();
+                return Some(nbns_msg(response, op, name, kind, rcode, None));
+            };
+            pos = next;
+        }
+    } else if !response {
+        return None;
+    }
+
+    let addr = if response {
+        if decoded.is_none() {
+            if an == 0 {
+                return None;
+            }
+            let (name, name_end) = read_nbns_name(body, pos)?;
+            if name_end + 2 > body.len() {
+                return None;
+            }
+            kind = Some(common::NbnsKind::from_u16(u16::from_be_bytes([body[name_end], body[name_end + 1]]))?);
+            decoded = Some(name);
+            nbns_addr_at(body, name_end)
+        } else {
+            nbns_first_addr(body, pos, an)
+        }
+    } else {
+        None
+    };
+    Some(nbns_msg(response, op, decoded?, kind?, rcode, addr))
+}
+
+fn nbns_msg(
+    response: bool,
+    op: common::NbnsOp,
+    name: NbnsDecoded,
+    kind: common::NbnsKind,
+    rcode: u8,
+    addr: Option<common::Ipv4Addr>,
+) -> common::UdpMsg {
+    common::UdpMsg::Nbns(common::NbnsMsg {
+        response,
+        op,
+        name: name.name,
+        suffix: name.suffix,
+        kind,
+        rcode,
+        addr,
+    })
+}
+
+fn read_nbns_name(packet: &[u8], mut pos: usize) -> Option<(NbnsDecoded, usize)> {
+    let mut hops = 0usize;
+    let mut end = None;
+    let mut decoded = None;
+    let mut steps = 0usize;
+    loop {
+        if pos >= packet.len() || steps > packet.len() {
+            return None;
+        }
+        steps += 1;
+        let len = packet[pos];
+        if len == 0 {
+            if end.is_none() {
+                end = Some(pos + 1);
+            }
+            break;
+        }
+        if len & 0xC0 == 0xC0 {
+            if pos + 1 >= packet.len() {
+                return None;
+            }
+            if end.is_none() {
+                end = Some(pos + 2);
+            }
+            hops += 1;
+            if hops > DNS_PTR_HOPS {
+                return None;
+            }
+            let off = (((len as usize) & 0x3F) << 8) | packet[pos + 1] as usize;
+            if off >= packet.len() {
+                return None;
+            }
+            pos = off;
+            continue;
+        }
+        if len & 0xC0 != 0 {
+            return None;
+        }
+        let n = len as usize;
+        if pos + 1 + n > packet.len() {
+            return None;
+        }
+        if decoded.is_none() {
+            if n != NBNS_LABEL_LEN {
+                return None;
+            }
+            decoded = Some(decode_nbns_label(&packet[pos + 1..pos + 1 + n])?);
+        }
+        pos += 1 + n;
+    }
+    Some((decoded?, end?))
+}
+
+fn decode_nbns_label(label: &[u8]) -> Option<NbnsDecoded> {
+    let mut raw = [0u8; 16];
+    for i in 0..16 {
+        let hi = nbns_nibble(label[i * 2])?;
+        let lo = nbns_nibble(label[i * 2 + 1])?;
+        raw[i] = (hi << 4) | lo;
+    }
+    let mut end = 15;
+    while end > 0 && raw[end - 1] == b' ' {
+        end -= 1;
+    }
+    let mut name = heapless::String::new();
+    for &b in &raw[..end] {
+        let c = if b == b' ' || b.is_ascii_graphic() { b as char } else { '?' };
+        if name.push(c).is_err() {
+            break;
+        }
+    }
+    Some(NbnsDecoded { name, suffix: raw[15] })
+}
+
+fn nbns_nibble(b: u8) -> Option<u8> {
+    if (b'A'..=b'P').contains(&b) { Some(b - b'A') } else { None }
+}
+
+fn nbns_first_addr(body: &[u8], mut pos: usize, an: u16) -> Option<common::Ipv4Addr> {
+    for _ in 0..an {
+        let (_, name_end) = read_nbns_name(body, pos)?;
+        if name_end + 10 > body.len() {
+            return None;
+        }
+        let rr_type = u16::from_be_bytes([body[name_end], body[name_end + 1]]);
+        let rdlen = u16::from_be_bytes([body[name_end + 8], body[name_end + 9]]) as usize;
+        let rdata = name_end + 10;
+        if rdata + rdlen > body.len() {
+            return None;
+        }
+        if rr_type == NBNS_TYPE_NB && rdlen >= NBNS_RDATA_MIN {
+            return Some(common::Ipv4Addr::new(body[rdata + 2], body[rdata + 3], body[rdata + 4], body[rdata + 5]));
+        }
+        pos = rdata + rdlen;
+    }
+    None
+}
+
+fn nbns_addr_at(body: &[u8], name_end: usize) -> Option<common::Ipv4Addr> {
+    if name_end + 10 > body.len() {
+        return None;
+    }
+    let rr_type = u16::from_be_bytes([body[name_end], body[name_end + 1]]);
+    let rdlen = u16::from_be_bytes([body[name_end + 8], body[name_end + 9]]) as usize;
+    let rdata = name_end + 10;
+    if rr_type != NBNS_TYPE_NB || rdlen < NBNS_RDATA_MIN || rdata + rdlen > body.len() {
+        return None;
+    }
+    Some(common::Ipv4Addr::new(body[rdata + 2], body[rdata + 3], body[rdata + 4], body[rdata + 5]))
+}
+
+fn dhcp4_hostname(value: &[u8]) -> heapless::String<{ common::UDP_QNAME_MAX }> {
+    let mut out = heapless::String::new();
+    for &b in value {
+        let c = if b.is_ascii_graphic() { b as char } else { '?' };
+        if out.push(c).is_err() {
+            break;
+        }
+    }
+    out
+}
+
+/// `Some` — первая строка M-SEARCH, NOTIFY или HTTP/1.x. `None` — это не SSDP.
+/// Заголовки NT, USN и LOCATION: первое вхождение, длиннее 128 символов обрезается.
+/// Пустая строка заканчивает заголовки. NTS не считается NT.
+fn parse_ssdp(body: &[u8]) -> Option<common::UdpMsg> {
+    let (first, mut rest) = split_ssdp_line(body);
+    if !ssdp_start_line(first) {
+        return None;
+    }
+    let start = ssdp_text(first);
+    if start.is_empty() {
+        return None;
+    }
+    let mut nt = None;
+    let mut usn = None;
+    let mut location = None;
+    while !rest.is_empty() {
+        let (line, next) = split_ssdp_line(rest);
+        rest = next;
+        if line.is_empty() {
+            break;
+        }
+        let Some((name, value)) = split_ssdp_header(line) else { continue };
+        if ssdp_name_is(name, b"NT") && nt.is_none() {
+            nt = Some(ssdp_text(value));
+        } else if ssdp_name_is(name, b"USN") && usn.is_none() {
+            usn = Some(ssdp_text(value));
+        } else if ssdp_name_is(name, b"LOCATION") && location.is_none() {
+            location = Some(ssdp_text(value));
+        }
+    }
+    Some(common::UdpMsg::Ssdp(common::SsdpMsg { start, nt, usn, location }))
+}
+
+fn ssdp_start_line(line: &[u8]) -> bool {
+    starts_with_ignore_ascii_case(line, b"M-SEARCH ")
+        || starts_with_ignore_ascii_case(line, b"NOTIFY ")
+        || starts_with_ignore_ascii_case(line, b"HTTP/1.")
+}
+
+fn split_ssdp_line(buf: &[u8]) -> (&[u8], &[u8]) {
+    if let Some(i) = buf.iter().position(|&b| b == b'\n') {
+        (trim_cr(&buf[..i]), &buf[i + 1..])
+    } else {
+        (trim_cr(buf), &[])
+    }
+}
+
+fn trim_cr(line: &[u8]) -> &[u8] {
+    match line.split_last() {
+        Some((b'\r', head)) => head,
+        _ => line,
+    }
+}
+
+fn split_ssdp_header(line: &[u8]) -> Option<(&[u8], &[u8])> {
+    let colon = line.iter().position(|&b| b == b':')?;
+    let name = trim_sp(&line[..colon]);
+    let value = trim_sp(&line[colon + 1..]);
+    if name.is_empty() || value.is_empty() {
+        None
+    } else {
+        Some((name, value))
+    }
+}
+
+fn trim_sp(s: &[u8]) -> &[u8] {
+    let start = s.iter().position(|b| *b != b' ' && *b != b'\t').unwrap_or(s.len());
+    let end = s.iter().rposition(|b| *b != b' ' && *b != b'\t').map(|i| i + 1).unwrap_or(start);
+    &s[start..end]
+}
+
+fn ssdp_name_is(name: &[u8], want: &[u8]) -> bool {
+    name.len() == want.len() && name.iter().zip(want).all(|(a, b)| a.eq_ignore_ascii_case(b))
+}
+
+fn starts_with_ignore_ascii_case(buf: &[u8], prefix: &[u8]) -> bool {
+    buf.len() >= prefix.len()
+        && buf[..prefix.len()].iter().zip(prefix).all(|(a, b)| a.eq_ignore_ascii_case(b))
+}
+
+fn ssdp_text(raw: &[u8]) -> heapless::String<{ common::UDP_SSDP_MAX }> {
+    let mut out = heapless::String::new();
+    for &b in raw {
+        let c = if b == b' ' || b.is_ascii_graphic() { b as char } else { '?' };
+        if out.push(c).is_err() {
+            break;
+        }
+    }
+    out
 }
 
 /// ESP: SPI из первых 4 байт. Sequence и ciphertext не читаются.
@@ -695,6 +1096,7 @@ fn ipv6_addr_from(bytes: &[u8]) -> Option<common::Ipv6Addr> {
 
 /// ICMPv6: etherparse разбирает известные типы; MLD (130–132, 143) приходит как Unknown.
 /// Target NDP и группа MLD читаются из хвоста после 8-байтного заголовка.
+/// У NS после target — Source LLA, у NA — Target LLA.
 fn parse_icmp6(
     payload: &[u8],
     src: &common::IpAddr,
@@ -710,6 +1112,30 @@ fn parse_icmp6(
 
 fn parse_mld_group(rest: &[u8]) -> Option<common::Ipv6Addr> {
     ipv6_addr_from(rest)
+}
+
+/// MAC соседа из опций NDP после 16-байтного target (RFC 4861 §4.6).
+/// `want` — тип 1 для NS, тип 2 для NA. Берётся первая опция этого типа длиной 1
+/// (8 байт: заголовок и Ethernet MAC). Длиннее 6 байт — пропускается.
+/// Длина 0 или заявка, вылезающая за срез, останавливает обход: уже найденный MAC сохраняется.
+fn ndp_neighbor_lladdr(options: &[u8], want: u8) -> Option<common::MacAddr6> {
+    let mut i = 0;
+    while i + 2 <= options.len() {
+        let opt_type = options[i];
+        let units = options[i + 1] as usize;
+        if units == 0 {
+            break;
+        }
+        let opt_bytes = units * 8;
+        if i + opt_bytes > options.len() {
+            break;
+        }
+        if opt_type == want && units == 1 {
+            return Some(common::MacAddr6::from_slice(&options[i + 2..i + 8]));
+        }
+        i += opt_bytes;
+    }
+    None
 }
 
 fn parse_icmp6_msg(
@@ -733,15 +1159,18 @@ fn parse_icmp6_msg(
         }),
         Icmpv6Type::NeighborSolicitation => {
             let target = ipv6_addr_from(rest)?;
-            Some(common::Icmp6Data::NeighborSolicitation { target })
+            let lladdr = ndp_neighbor_lladdr(&rest[16..], common::ICMP6_NDP_OPT_SRC_LLADDR);
+            Some(common::Icmp6Data::NeighborSolicitation { target, lladdr })
         }
         Icmpv6Type::NeighborAdvertisement(na) => {
             let target = ipv6_addr_from(rest)?;
+            let lladdr = ndp_neighbor_lladdr(&rest[16..], common::ICMP6_NDP_OPT_TGT_LLADDR);
             Some(common::Icmp6Data::NeighborAdvertisement {
                 router: na.router,
                 solicited: na.solicited,
                 override_flag: na.r#override,
                 target,
+                lladdr,
             })
         }
         Icmpv6Type::Redirect => {
@@ -1826,7 +2255,7 @@ mod tests {
     fn udp_dhcp4_discover() {
         let data = ipv4_udp(68, 67, &dhcp4_with_options(&[53, 1, 1, 255]));
         match data.l4.clone() {
-            common::IpL4::Udp { app: common::UdpApp::Dhcp4, msg: Some(common::UdpMsg::Dhcp4 { msg: Some(common::Dhcp4Msg::Discover) }), .. } => {}
+            common::IpL4::Udp { app: common::UdpApp::Dhcp4, msg: Some(common::UdpMsg::Dhcp4 { msg: Some(common::Dhcp4Msg::Discover), host: None, requested: None }), .. } => {}
             other => panic!("expected DHCP Discover, got {other:?}"),
         }
         assert!(format!("{}", data).contains("UDP/DHCP Discover"));
@@ -1847,7 +2276,7 @@ mod tests {
     fn udp_dhcp4_cookie_without_msg_type() {
         let data = ipv4_udp(67, 68, &dhcp4_with_options(&[]));
         match data.l4.clone() {
-            common::IpL4::Udp { app: common::UdpApp::Dhcp4, msg: Some(common::UdpMsg::Dhcp4 { msg: None }), .. } => {}
+            common::IpL4::Udp { app: common::UdpApp::Dhcp4, msg: Some(common::UdpMsg::Dhcp4 { msg: None, host: None, requested: None }), .. } => {}
             other => panic!("expected DHCP without type, got {other:?}"),
         }
     }
@@ -1859,8 +2288,386 @@ mod tests {
             0, 12, 5, b'h', b'o', b's', b't', b'1', 53, 1, 3, 255,
         ]));
         match data.l4.clone() {
-            common::IpL4::Udp { msg: Some(common::UdpMsg::Dhcp4 { msg: Some(common::Dhcp4Msg::Request) }), .. } => {}
+            common::IpL4::Udp { msg: Some(common::UdpMsg::Dhcp4 {
+                msg: Some(common::Dhcp4Msg::Request), host: Some(name), requested: None,
+            }), .. } => assert_eq!(name.as_str(), "host1"),
             other => panic!("expected DHCP Request, got {other:?}"),
+        }
+    }
+
+    /// Опция 12 — имя хоста, опция 50 — запрошенный адрес. Обе читаются и после типа.
+    #[test]
+    fn udp_dhcp4_hostname_and_requested() {
+        let data = ipv4_udp(68, 67, &dhcp4_with_options(&[
+            53, 1, 3,
+            50, 4, 192, 168, 1, 50,
+            12, 7, b'p', b'r', b'i', b'n', b't', b'e', b'r',
+            255,
+        ]));
+        match data.l4.clone() {
+            common::IpL4::Udp { msg: Some(common::UdpMsg::Dhcp4 {
+                msg: Some(common::Dhcp4Msg::Request), host: Some(name), requested: Some(ip),
+            }), .. } => {
+                assert_eq!(name.as_str(), "printer");
+                assert_eq!(ip, common::Ipv4Addr::new(192, 168, 1, 50));
+            }
+            other => panic!("expected DHCP host and requested address, got {other:?}"),
+        }
+        let s = format!("{}", data);
+        assert!(s.contains("host=printer"));
+        assert!(s.contains("req=192.168.1.50"));
+    }
+
+    /// Имя длиннее 64 символов обрезается, пакет остаётся DHCP.
+    #[test]
+    fn udp_dhcp4_hostname_truncated_to_64() {
+        let mut options = vec![12, 70];
+        options.extend(std::iter::repeat(b'a').take(70));
+        options.push(255);
+        let data = ipv4_udp(68, 67, &dhcp4_with_options(&options));
+        match data.l4.clone() {
+            common::IpL4::Udp { msg: Some(common::UdpMsg::Dhcp4 { host: Some(name), .. }), .. } => {
+                assert_eq!(name.len(), common::UDP_QNAME_MAX);
+                assert!(name.chars().all(|c| c == 'a'));
+            }
+            other => panic!("expected truncated hostname, got {other:?}"),
+        }
+    }
+
+    /// Опция 50 не из 4 байт не становится адресом. Имя из соседней опции сохраняется.
+    #[test]
+    fn udp_dhcp4_requested_wrong_length_skipped() {
+        let data = ipv4_udp(68, 67, &dhcp4_with_options(&[
+            50, 2, 10, 0, 12, 1, b'a', 255,
+        ]));
+        match data.l4.clone() {
+            common::IpL4::Udp { msg: Some(common::UdpMsg::Dhcp4 {
+                host: Some(name), requested: None, ..
+            }), .. } => assert_eq!(name.as_str(), "a"),
+            other => panic!("expected hostname without requested address, got {other:?}"),
+        }
+    }
+
+    /// Обрезанная опция 50 не даёт частичный адрес. Уже прочитанное имя остаётся.
+    #[test]
+    fn udp_dhcp4_truncated_requested_keeps_hostname() {
+        let data = ipv4_udp(68, 67, &dhcp4_with_options(&[
+            12, 1, b'a', 50, 4, 192, 168,
+        ]));
+        match data.l4.clone() {
+            common::IpL4::Udp { msg: Some(common::UdpMsg::Dhcp4 {
+                host: Some(name), requested: None, ..
+            }), .. } => assert_eq!(name.as_str(), "a"),
+            other => panic!("expected hostname, truncated requested dropped, got {other:?}"),
+        }
+    }
+
+    /// DHCPv6 Solicit: 4 байта, тип в первом. В строке есть тип.
+    #[test]
+    fn udp_dhcp6_solicit() {
+        let data = ipv4_udp(546, 547, &[1, 0x11, 0x22, 0x33]);
+        match data.l4.clone() {
+            common::IpL4::Udp { app: common::UdpApp::Dhcp6, msg: Some(common::UdpMsg::Dhcp6 { msg: common::Dhcp6Msg::Solicit }), .. } => {}
+            other => panic!("expected DHCPv6 Solicit, got {other:?}"),
+        }
+        assert!(format!("{}", data).contains("UDP/DHCPv6 Solicit"));
+    }
+
+    /// Reply — клиентское сообщение, хватает 4 байт.
+    #[test]
+    fn udp_dhcp6_reply() {
+        let data = ipv4_udp(547, 546, &[7, 0, 0, 1]);
+        match data.l4.clone() {
+            common::IpL4::Udp { msg: Some(common::UdpMsg::Dhcp6 { msg: common::Dhcp6Msg::Reply }), .. } => {}
+            other => panic!("expected DHCPv6 Reply, got {other:?}"),
+        }
+    }
+
+    /// Relay-forward подтверждается только с заголовком в 34 байта.
+    #[test]
+    fn udp_dhcp6_relay_forward() {
+        let mut body = vec![12u8, 0];
+        body.extend_from_slice(&[0u8; 32]);
+        let data = ipv4_udp(547, 547, &body);
+        match data.l4.clone() {
+            common::IpL4::Udp { msg: Some(common::UdpMsg::Dhcp6 { msg: common::Dhcp6Msg::RelayForw }), .. } => {}
+            other => panic!("expected DHCPv6 Relay-forward, got {other:?}"),
+        }
+        assert!(format!("{}", data).contains("UDP/DHCPv6 Relay-forward"));
+    }
+
+    /// Relay короче 34 байт снимает ярлык.
+    #[test]
+    fn udp_dhcp6_relay_too_short_is_other() {
+        let data = ipv4_udp(547, 547, &[12u8, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        match data.l4.clone() {
+            common::IpL4::Udp { app: common::UdpApp::Other, msg: None, .. } => {}
+            other => panic!("expected plain UDP, got {other:?}"),
+        }
+    }
+
+    /// Solicit короче заголовка и нулевой тип не подтверждают DHCPv6.
+    #[test]
+    fn udp_dhcp6_bad_header_is_other() {
+        for body in [&[1u8, 0, 0][..], &[0, 0, 0, 0][..], &[99, 0, 0, 0][..]] {
+            let data = ipv4_udp(546, 547, body);
+            match data.l4.clone() {
+                common::IpL4::Udp { app: common::UdpApp::Other, msg: None, .. } => {}
+                other => panic!("expected plain UDP for {body:?}, got {other:?}"),
+            }
+        }
+    }
+
+    fn push_nbns_name(buf: &mut Vec<u8>, name: &str, suffix: u8) {
+        buf.push(32);
+        let mut raw = [b' '; 16];
+        let bytes = name.as_bytes();
+        let n = bytes.len().min(15);
+        raw[..n].copy_from_slice(&bytes[..n]);
+        raw[15] = suffix;
+        for b in raw {
+            buf.push(b'A' + (b >> 4));
+            buf.push(b'A' + (b & 0x0F));
+        }
+        buf.push(0);
+    }
+
+    fn nbns_packet(flags: u16, qd: u16, an: u16, rest: &[u8]) -> Vec<u8> {
+        let mut body = vec![0u8; 12];
+        body[2..4].copy_from_slice(&flags.to_be_bytes());
+        body[4..6].copy_from_slice(&qd.to_be_bytes());
+        body[6..8].copy_from_slice(&an.to_be_bytes());
+        body.extend_from_slice(rest);
+        body
+    }
+
+    /// Запрос NBNS: имя и суффикс. Код результата в строку не попадает.
+    #[test]
+    fn udp_nbns_query() {
+        let mut rest = Vec::new();
+        push_nbns_name(&mut rest, "WORKSTATION", 0x00);
+        rest.extend_from_slice(&[0x00, 0x20, 0x00, 0x01]);
+        let data = ipv4_udp(137, 137, &nbns_packet(0x0110, 1, 0, &rest));
+        match data.l4.clone() {
+            common::IpL4::Udp { app: common::UdpApp::Nbns, msg: Some(common::UdpMsg::Nbns(n)), .. } => {
+                assert!(!n.response);
+                assert_eq!(n.op, common::NbnsOp::Query);
+                assert_eq!(n.name.as_str(), "WORKSTATION");
+                assert_eq!(n.suffix, 0x00);
+                assert_eq!(n.kind, common::NbnsKind::Nb);
+                assert!(n.addr.is_none());
+            }
+            other => panic!("expected NBNS query, got {other:?}"),
+        }
+        let shown = format!("{}", data);
+        assert!(shown.contains("UDP/NBNS Query WORKSTATION <00>"));
+        assert!(shown.contains("src:"));
+        assert!(shown.contains("dst:"));
+        assert!(!shown.contains("rcode="));
+    }
+
+    /// Регистрация — код операции 5, это не ответ.
+    #[test]
+    fn udp_nbns_registration() {
+        let mut rest = Vec::new();
+        push_nbns_name(&mut rest, "WORKSTATION", 0x00);
+        rest.extend_from_slice(&[0x00, 0x20, 0x00, 0x01]);
+        let data = ipv4_udp(137, 137, &nbns_packet(0x2910, 1, 0, &rest));
+        match data.l4.clone() {
+            common::IpL4::Udp { msg: Some(common::UdpMsg::Nbns(n)), .. } => {
+                assert!(!n.response);
+                assert_eq!(n.op, common::NbnsOp::Registration);
+            }
+            other => panic!("expected NBNS registration, got {other:?}"),
+        }
+        assert!(format!("{}", data).contains("UDP/NBNS Registration WORKSTATION <00>"));
+    }
+
+    /// Ответ: имя вопроса сжатым указателем и IPv4 из NB-записи.
+    #[test]
+    fn udp_nbns_response_address() {
+        let mut rest = Vec::new();
+        push_nbns_name(&mut rest, "WORKSTATION", 0x20);
+        rest.extend_from_slice(&[0x00, 0x20, 0x00, 0x01]);
+        rest.extend_from_slice(&[0xC0, 0x0C]);
+        rest.extend_from_slice(&[0x00, 0x20, 0x00, 0x01, 0, 0, 0, 0, 0, 6, 0, 0, 192, 168, 1, 20]);
+        let data = ipv4_udp(137, 137, &nbns_packet(0x8500, 1, 1, &rest));
+        match data.l4.clone() {
+            common::IpL4::Udp { msg: Some(common::UdpMsg::Nbns(n)), .. } => {
+                assert!(n.response);
+                assert_eq!(n.name.as_str(), "WORKSTATION");
+                assert_eq!(n.suffix, 0x20);
+                assert_eq!(n.addr, Some(common::Ipv4Addr::new(192, 168, 1, 20)));
+                assert_eq!(n.rcode, 0);
+            }
+            other => panic!("expected NBNS response, got {other:?}"),
+        }
+        assert!(format!("{}", data).contains("UDP/NBNS Response WORKSTATION <20> 192.168.1.20"));
+    }
+
+    /// Отрицательный ответ хранит код и не выдумывает адрес.
+    #[test]
+    fn udp_nbns_response_rcode() {
+        let mut rest = Vec::new();
+        push_nbns_name(&mut rest, "WORKSTATION", 0x00);
+        rest.extend_from_slice(&[0x00, 0x20, 0x00, 0x01]);
+        let data = ipv4_udp(137, 137, &nbns_packet(0x8003, 1, 0, &rest));
+        match data.l4.clone() {
+            common::IpL4::Udp { msg: Some(common::UdpMsg::Nbns(n)), .. } => {
+                assert!(n.response);
+                assert_eq!(n.rcode, 3);
+                assert!(n.addr.is_none());
+            }
+            other => panic!("expected NBNS error response, got {other:?}"),
+        }
+        assert!(format!("{}", data).contains("UDP/NBNS Response WORKSTATION <00> rcode=3"));
+    }
+
+    /// Ответ без вопросов: имя и адрес из первой записи.
+    #[test]
+    fn udp_nbns_response_without_question() {
+        let mut rest = Vec::new();
+        push_nbns_name(&mut rest, "SERVER", 0x20);
+        rest.extend_from_slice(&[0x00, 0x20, 0x00, 0x01, 0, 0, 0, 0, 0, 6, 0, 0, 10, 0, 0, 5]);
+        let data = ipv4_udp(137, 137, &nbns_packet(0x8400, 0, 1, &rest));
+        match data.l4.clone() {
+            common::IpL4::Udp { msg: Some(common::UdpMsg::Nbns(n)), .. } => {
+                assert_eq!(n.name.as_str(), "SERVER");
+                assert_eq!(n.addr, Some(common::Ipv4Addr::new(10, 0, 0, 5)));
+            }
+            other => panic!("expected NBNS answer without question, got {other:?}"),
+        }
+    }
+
+    /// NBSTAT виден в строке. Короткая NB-запись не даёт адрес, имя остаётся.
+    #[test]
+    fn udp_nbns_nbstat_and_short_rdata() {
+        let mut rest = Vec::new();
+        push_nbns_name(&mut rest, "WORKSTATION", 0x00);
+        rest.extend_from_slice(&[0x00, 0x21, 0x00, 0x01]);
+        let data = ipv4_udp(137, 137, &nbns_packet(0x0110, 1, 0, &rest));
+        match data.l4.clone() {
+            common::IpL4::Udp { msg: Some(common::UdpMsg::Nbns(n)), .. } => {
+                assert_eq!(n.kind, common::NbnsKind::NbStat);
+            }
+            other => panic!("expected NBSTAT, got {other:?}"),
+        }
+        assert!(format!("{}", data).contains("NBSTAT"));
+
+        let mut rest = Vec::new();
+        push_nbns_name(&mut rest, "WORKSTATION", 0x00);
+        rest.extend_from_slice(&[0x00, 0x20, 0x00, 0x01]);
+        rest.extend_from_slice(&[0xC0, 0x0C, 0x00, 0x20, 0x00, 0x01, 0, 0, 0, 0, 0, 4, 1, 2, 3, 4]);
+        let data = ipv4_udp(137, 137, &nbns_packet(0x8500, 1, 1, &rest));
+        match data.l4.clone() {
+            common::IpL4::Udp { msg: Some(common::UdpMsg::Nbns(n)), .. } => {
+                assert_eq!(n.name.as_str(), "WORKSTATION");
+                assert!(n.addr.is_none());
+            }
+            other => panic!("expected name without address, got {other:?}"),
+        }
+    }
+
+    /// Метка не из A–P снимает ярлык порта.
+    #[test]
+    fn udp_nbns_bad_label_is_other() {
+        let mut rest = vec![32u8];
+        rest.extend(std::iter::repeat(b'A').take(31));
+        rest.push(b'Z');
+        rest.push(0);
+        rest.extend_from_slice(&[0x00, 0x20, 0x00, 0x01]);
+        let data = ipv4_udp(137, 137, &nbns_packet(0x0110, 1, 0, &rest));
+        match data.l4.clone() {
+            common::IpL4::Udp { app: common::UdpApp::Other, msg: None, .. } => {}
+            other => panic!("expected plain UDP, got {other:?}"),
+        }
+    }
+
+    /// NOTIFY: первая строка и заголовки NT, USN, LOCATION. NTS не попадает в NT.
+    #[test]
+    fn udp_ssdp_notify_headers() {
+        let body = b"\
+NOTIFY * HTTP/1.1\r\n\
+HOST: 239.255.255.250:1900\r\n\
+NTS: ssdp:alive\r\n\
+nt: urn:device:1\r\n\
+USN: uuid:abc\r\n\
+Location: http://192.168.0.2/desc.xml\r\n\
+\r\n";
+        let data = ipv4_udp(1900, 1900, body);
+        match data.l4.clone() {
+            common::IpL4::Udp { app: common::UdpApp::Ssdp, msg: Some(common::UdpMsg::Ssdp(s)), .. } => {
+                assert_eq!(s.start.as_str(), "NOTIFY * HTTP/1.1");
+                assert_eq!(s.nt.unwrap().as_str(), "urn:device:1");
+                assert_eq!(s.usn.unwrap().as_str(), "uuid:abc");
+                assert_eq!(s.location.unwrap().as_str(), "http://192.168.0.2/desc.xml");
+            }
+            other => panic!("expected SSDP NOTIFY, got {other:?}"),
+        }
+        let shown = format!("{}", data);
+        assert!(shown.contains("UDP/SSDP NOTIFY * HTTP/1.1"));
+        assert!(shown.contains("NT=urn:device:1"));
+        assert!(shown.contains("USN=uuid:abc"));
+        assert!(shown.contains("LOCATION=http://192.168.0.2/desc.xml"));
+    }
+
+    /// M-SEARCH без NT/USN/LOCATION остаётся SSDP, поля пустые.
+    #[test]
+    fn udp_ssdp_msearch_start_only() {
+        let body = b"M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\n\r\n";
+        let data = ipv4_udp(45000, 1900, body);
+        match data.l4.clone() {
+            common::IpL4::Udp { app: common::UdpApp::Ssdp, msg: Some(common::UdpMsg::Ssdp(s)), .. } => {
+                assert_eq!(s.start.as_str(), "M-SEARCH * HTTP/1.1");
+                assert!(s.nt.is_none());
+                assert!(s.usn.is_none());
+                assert!(s.location.is_none());
+            }
+            other => panic!("expected SSDP M-SEARCH, got {other:?}"),
+        }
+    }
+
+    /// Ответ HTTP/1.1: LOCATION и USN, NT нет.
+    #[test]
+    fn udp_ssdp_http_response() {
+        let body = b"HTTP/1.1 200 OK\nUSN: uuid:dev\nLOCATION: http://10.0.0.1/\n\n";
+        let data = ipv4_udp(1900, 50000, body);
+        match data.l4.clone() {
+            common::IpL4::Udp { msg: Some(common::UdpMsg::Ssdp(s)), .. } => {
+                assert_eq!(s.start.as_str(), "HTTP/1.1 200 OK");
+                assert!(s.nt.is_none());
+                assert_eq!(s.usn.unwrap().as_str(), "uuid:dev");
+                assert_eq!(s.location.unwrap().as_str(), "http://10.0.0.1/");
+            }
+            other => panic!("expected SSDP response, got {other:?}"),
+        }
+    }
+
+    /// Повтор NT: берётся первое. Длинный LOCATION обрезается до 128.
+    #[test]
+    fn udp_ssdp_first_nt_and_truncated_location() {
+        let mut body = b"NOTIFY * HTTP/1.1\r\nNT: urn:first\r\nNT: urn:second\r\nLOCATION: ".to_vec();
+        body.extend(std::iter::repeat(b'u').take(140));
+        body.extend_from_slice(b"\r\n\r\n");
+        let data = ipv4_udp(1900, 1900, &body);
+        match data.l4.clone() {
+            common::IpL4::Udp { msg: Some(common::UdpMsg::Ssdp(s)), .. } => {
+                assert_eq!(s.nt.unwrap().as_str(), "urn:first");
+                let loc = s.location.unwrap();
+                assert_eq!(loc.len(), common::UDP_SSDP_MAX);
+                assert!(loc.chars().all(|c| c == 'u'));
+            }
+            other => panic!("expected first NT and truncated LOCATION, got {other:?}"),
+        }
+    }
+
+    /// Тело без стартовой строки SSDP снимает ярлык порта.
+    #[test]
+    fn udp_ssdp_garbage_is_other() {
+        let data = ipv4_udp(1900, 1900, b"not a search");
+        match data.l4.clone() {
+            common::IpL4::Udp { app: common::UdpApp::Other, msg: None, .. } => {}
+            other => panic!("expected plain UDP, got {other:?}"),
         }
     }
 
@@ -1869,8 +2676,9 @@ mod tests {
     fn udp_dns() {
         let data = ipv4_udp(12345, 53, &dns_query("example.com"));
         match data.l4.clone() {
-            common::IpL4::Udp { app: common::UdpApp::Dns, msg: Some(common::UdpMsg::Query(name)), .. } => {
-                assert_eq!(name.as_str(), "example.com");
+            common::IpL4::Udp { app: common::UdpApp::Dns, msg: Some(common::UdpMsg::Query(q)), .. } => {
+                assert_eq!(q.name.unwrap().as_str(), "example.com");
+                assert!(q.srv.is_none());
             }
             other => panic!("expected query name, got {other:?}"),
         }
@@ -1897,8 +2705,9 @@ mod tests {
         body.extend_from_slice(&[7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0]);
         let data = ipv4_udp(5355, 5355, &body);
         match data.l4.clone() {
-            common::IpL4::Udp { app: common::UdpApp::Llmnr, msg: Some(common::UdpMsg::Query(name)), .. } => {
-                assert_eq!(name.as_str(), "www.example.com");
+            common::IpL4::Udp { app: common::UdpApp::Llmnr, msg: Some(common::UdpMsg::Query(q)), .. } => {
+                assert_eq!(q.name.unwrap().as_str(), "www.example.com");
+                assert!(q.srv.is_none());
             }
             other => panic!("expected compressed name, got {other:?}"),
         }
@@ -1922,10 +2731,155 @@ mod tests {
     fn udp_mdns_beats_dns() {
         let data = ipv4_udp(53, 5353, &dns_query("printer.local"));
         match data.l4.clone() {
-            common::IpL4::Udp { app: common::UdpApp::Mdns, msg: Some(common::UdpMsg::Query(name)), .. } => {
-                assert_eq!(name.as_str(), "printer.local");
+            common::IpL4::Udp { app: common::UdpApp::Mdns, msg: Some(common::UdpMsg::Query(q)), .. } => {
+                assert_eq!(q.name.unwrap().as_str(), "printer.local");
+                assert!(q.srv.is_none());
             }
             other => panic!("expected mDNS name, got {other:?}"),
+        }
+    }
+
+    fn append_dns_name(buf: &mut Vec<u8>, name: &str) {
+        for label in name.split('.') {
+            buf.push(label.len() as u8);
+            buf.extend_from_slice(label.as_bytes());
+        }
+        buf.push(0);
+    }
+
+    /// Ответ mDNS: порт и хост первой SRV. Приоритет и вес не сохраняются.
+    #[test]
+    fn udp_mdns_srv_port_and_host() {
+        let mut body = vec![0u8; 12];
+        body[5] = 1;
+        body[7] = 1;
+        append_dns_name(&mut body, "_ipp._tcp.local");
+        body.extend_from_slice(&[0, 33, 0, 1]);
+        append_dns_name(&mut body, "Office._ipp._tcp.local");
+        body.extend_from_slice(&[0, 33, 0, 1, 0, 0, 0, 120]);
+        let mut rdata = vec![0, 10, 0, 20, 0x02, 0x77];
+        append_dns_name(&mut rdata, "printer.local");
+        body.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        body.extend_from_slice(&rdata);
+
+        let data = ipv4_udp(5353, 5353, &body);
+        match data.l4.clone() {
+            common::IpL4::Udp { msg: Some(common::UdpMsg::Query(q)), .. } => {
+                assert_eq!(q.name.unwrap().as_str(), "_ipp._tcp.local");
+                let srv = q.srv.unwrap();
+                assert_eq!(srv.port, 631);
+                assert_eq!(srv.host.as_str(), "printer.local");
+            }
+            other => panic!("expected SRV port and host, got {other:?}"),
+        }
+        let shown = format!("{}", data);
+        assert!(shown.contains("q=_ipp._tcp.local"));
+        assert!(shown.contains("SRV port=631 host=printer.local"));
+    }
+
+    /// Объявление без вопросов: остаётся mDNS с портом и хостом SRV.
+    #[test]
+    fn udp_mdns_srv_without_question() {
+        let mut body = vec![0u8; 12];
+        body[7] = 1;
+        append_dns_name(&mut body, "Office._ipp._tcp.local");
+        body.extend_from_slice(&[0, 33, 0, 1, 0, 0, 0, 0]);
+        let mut rdata = vec![0, 0, 0, 0, 0x00, 80];
+        append_dns_name(&mut rdata, "office.local");
+        body.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        body.extend_from_slice(&rdata);
+
+        let data = ipv4_udp(5353, 5353, &body);
+        match data.l4.clone() {
+            common::IpL4::Udp { app: common::UdpApp::Mdns, msg: Some(common::UdpMsg::Query(q)), .. } => {
+                assert!(q.name.is_none());
+                let srv = q.srv.unwrap();
+                assert_eq!(srv.port, 80);
+                assert_eq!(srv.host.as_str(), "office.local");
+            }
+            other => panic!("expected SRV without question, got {other:?}"),
+        }
+    }
+
+    /// Хост SRV сжатым указателем на имя вопроса.
+    #[test]
+    fn udp_mdns_srv_compressed_host() {
+        let mut body = vec![0u8; 12];
+        body[5] = 1;
+        body[7] = 1;
+        let name_at = body.len();
+        append_dns_name(&mut body, "printer.local");
+        body.extend_from_slice(&[0, 33, 0, 1]);
+        body.extend_from_slice(&[0xC0, name_at as u8]);
+        body.extend_from_slice(&[0, 33, 0, 1, 0, 0, 0, 0]);
+        let rdata = [0, 0, 0, 0, 0x02, 0x77, 0xC0, name_at as u8];
+        body.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        body.extend_from_slice(&rdata);
+
+        let data = ipv4_udp(5353, 5353, &body);
+        match data.l4.clone() {
+            common::IpL4::Udp { msg: Some(common::UdpMsg::Query(q)), .. } => {
+                let srv = q.srv.unwrap();
+                assert_eq!(srv.port, 631);
+                assert_eq!(srv.host.as_str(), "printer.local");
+            }
+            other => panic!("expected compressed SRV host, got {other:?}"),
+        }
+    }
+
+    /// Запись A перед SRV пропускается. Из двух SRV берётся первая.
+    #[test]
+    fn udp_mdns_srv_skips_a_and_keeps_first() {
+        let mut body = vec![0u8; 12];
+        body[5] = 1;
+        body[7] = 3;
+        append_dns_name(&mut body, "printer.local");
+        body.extend_from_slice(&[0, 33, 0, 1]);
+        let owner = [0xC0u8, 12];
+        body.extend_from_slice(&owner);
+        body.extend_from_slice(&[0, 1, 0, 1, 0, 0, 0, 0, 0, 4, 10, 0, 0, 2]);
+        body.extend_from_slice(&owner);
+        body.extend_from_slice(&[0, 33, 0, 1, 0, 0, 0, 0]);
+        let mut first = vec![0, 0, 0, 0, 0x02, 0x77];
+        append_dns_name(&mut first, "a.local");
+        body.extend_from_slice(&(first.len() as u16).to_be_bytes());
+        body.extend_from_slice(&first);
+        body.extend_from_slice(&owner);
+        body.extend_from_slice(&[0, 33, 0, 1, 0, 0, 0, 0]);
+        let mut second = vec![0, 0, 0, 0, 0x00, 1];
+        append_dns_name(&mut second, "b.local");
+        body.extend_from_slice(&(second.len() as u16).to_be_bytes());
+        body.extend_from_slice(&second);
+
+        let data = ipv4_udp(5353, 5353, &body);
+        match data.l4.clone() {
+            common::IpL4::Udp { msg: Some(common::UdpMsg::Query(q)), .. } => {
+                let srv = q.srv.unwrap();
+                assert_eq!(srv.port, 631);
+                assert_eq!(srv.host.as_str(), "a.local");
+            }
+            other => panic!("expected first SRV after A, got {other:?}"),
+        }
+    }
+
+    /// SRV без целевого имени не даёт порт. Имя вопроса сохраняется.
+    #[test]
+    fn udp_mdns_srv_without_host_keeps_question() {
+        let mut body = vec![0u8; 12];
+        body[5] = 1;
+        body[7] = 1;
+        append_dns_name(&mut body, "printer.local");
+        body.extend_from_slice(&[0, 33, 0, 1]);
+        body.extend_from_slice(&[0xC0, 12]);
+        body.extend_from_slice(&[0, 33, 0, 1, 0, 0, 0, 0, 0, 6, 0, 0, 0, 0, 0x02, 0x77]);
+
+        let data = ipv4_udp(5353, 5353, &body);
+        match data.l4.clone() {
+            common::IpL4::Udp { msg: Some(common::UdpMsg::Query(q)), .. } => {
+                assert_eq!(q.name.unwrap().as_str(), "printer.local");
+                assert!(q.srv.is_none());
+            }
+            other => panic!("expected question without SRV, got {other:?}"),
         }
     }
 
@@ -1966,8 +2920,98 @@ mod tests {
         icmp.extend_from_slice(&target.octets());
         let data = expect_ip(ipv6_l4(etherparse::IpNumber::IPV6_ICMP, &icmp));
         match data.l4.clone() {
-            common::IpL4::Icmp6(common::Icmp6Data::NeighborSolicitation { target: t }) => assert_eq!(t, target),
+            common::IpL4::Icmp6(common::Icmp6Data::NeighborSolicitation { target: t, lladdr: None }) => assert_eq!(t, target),
             other => panic!("expected NS, got {other:?}"),
+        }
+    }
+
+    fn ndp_option(opt_type: u8, mac: [u8; 6]) -> [u8; 8] {
+        [opt_type, 1, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]]
+    }
+
+    /// NS: Source LLA (тип 1) после target — MAC спрашивающего.
+    #[test]
+    fn ipv6_icmp_ns_source_lladdr() {
+        let target = common::Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+        let mac = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let hdr = etherparse::Icmpv6Header::new(etherparse::Icmpv6Type::NeighborSolicitation);
+        let mut icmp = Vec::from(hdr.to_bytes().as_slice());
+        icmp.extend_from_slice(&target.octets());
+        icmp.extend_from_slice(&ndp_option(common::ICMP6_NDP_OPT_SRC_LLADDR, mac));
+        let data = expect_ip(ipv6_l4(etherparse::IpNumber::IPV6_ICMP, &icmp));
+        match data.l4.clone() {
+            common::IpL4::Icmp6(common::Icmp6Data::NeighborSolicitation { target: t, lladdr: Some(m) }) => {
+                assert_eq!(t, target);
+                assert_eq!(m, common::MacAddr6::new(mac));
+            }
+            other => panic!("expected NS with lladdr, got {other:?}"),
+        }
+        assert!(format!("{}", data).contains("lladdr=02:11:22:33:44:55"));
+    }
+
+    /// NA: Target LLA (тип 2) — MAC объявляемого соседа. Source LLA на NA не читается.
+    #[test]
+    fn ipv6_icmp_na_target_lladdr() {
+        let target = common::Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
+        let mac = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
+        let na = etherparse::icmpv6::NeighborAdvertisementHeader {
+            router: false,
+            solicited: true,
+            r#override: true,
+        };
+        let hdr = etherparse::Icmpv6Header::new(etherparse::Icmpv6Type::NeighborAdvertisement(na));
+        let mut icmp = Vec::from(hdr.to_bytes().as_slice());
+        icmp.extend_from_slice(&target.octets());
+        icmp.extend_from_slice(&ndp_option(common::ICMP6_NDP_OPT_SRC_LLADDR, [0x02, 0, 0, 0, 0, 1]));
+        icmp.extend_from_slice(&ndp_option(common::ICMP6_NDP_OPT_TGT_LLADDR, mac));
+        let data = expect_ip(ipv6_l4(etherparse::IpNumber::IPV6_ICMP, &icmp));
+        match data.l4.clone() {
+            common::IpL4::Icmp6(common::Icmp6Data::NeighborAdvertisement {
+                router, solicited, override_flag, target: t, lladdr: Some(m),
+            }) => {
+                assert!(!router);
+                assert!(solicited);
+                assert!(override_flag);
+                assert_eq!(t, target);
+                assert_eq!(m, common::MacAddr6::new(mac));
+            }
+            other => panic!("expected NA with target lladdr, got {other:?}"),
+        }
+    }
+
+    /// Неизвестная опция перед Source LLA пропускается, MAC берётся из следующей.
+    #[test]
+    fn ipv6_icmp_ns_skips_unknown_option() {
+        let target = common::Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 3);
+        let mac = [0x02, 0x10, 0x20, 0x30, 0x40, 0x50];
+        let hdr = etherparse::Icmpv6Header::new(etherparse::Icmpv6Type::NeighborSolicitation);
+        let mut icmp = Vec::from(hdr.to_bytes().as_slice());
+        icmp.extend_from_slice(&target.octets());
+        icmp.extend_from_slice(&ndp_option(25, [0xff; 6]));
+        icmp.extend_from_slice(&ndp_option(common::ICMP6_NDP_OPT_SRC_LLADDR, mac));
+        let data = expect_ip(ipv6_l4(etherparse::IpNumber::IPV6_ICMP, &icmp));
+        match data.l4.clone() {
+            common::IpL4::Icmp6(common::Icmp6Data::NeighborSolicitation { lladdr: Some(m), .. }) => {
+                assert_eq!(m, common::MacAddr6::new(mac));
+            }
+            other => panic!("expected NS lladdr after unknown option, got {other:?}"),
+        }
+    }
+
+    /// Опция, заявленная длиннее хвоста, не даёт частичный MAC. Target сохраняется.
+    #[test]
+    fn ipv6_icmp_ns_truncated_option_has_no_lladdr() {
+        let target = common::Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 4);
+        let hdr = etherparse::Icmpv6Header::new(etherparse::Icmpv6Type::NeighborSolicitation);
+        let mut icmp = Vec::from(hdr.to_bytes().as_slice());
+        icmp.extend_from_slice(&target.octets());
+        icmp.extend_from_slice(&[common::ICMP6_NDP_OPT_SRC_LLADDR, 1, 0x02, 0x11]);
+        let data = expect_ip(ipv6_l4(etherparse::IpNumber::IPV6_ICMP, &icmp));
+        match data.l4.clone() {
+            common::IpL4::Icmp6(common::Icmp6Data::NeighborSolicitation { target: t, lladdr: None }) => {
+                assert_eq!(t, target);
+            }
+            other => panic!("expected NS without lladdr, got {other:?}"),
         }
     }
 

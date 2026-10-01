@@ -23,9 +23,9 @@
 `IpData` больше не `Copy`. Транспорт — одно поле `l4: IpL4` (адреса и `len` снаружи). Порты только у `Tcp` и `Udp`.
 
 - `Udp.app` — ярлык по порту **с любой стороны**. Специфичный важнее: DHCP/mDNS/SSDP, затем DNS/LLMNR/NTP, затем QUIC/WireGuard/ESP-UDP (`4500`), иначе `Other`.
-- `Udp.msg` — подтверждение тела. DNS/mDNS/LLMNR: первое имя вопроса (сжатие указателями, не длиннее 64 символов); вопросов нет — ярлык остаётся без имени. DHCP: magic cookie `63825363`, опция 53 если есть. Cookie нет или имя DNS битое — ярлык снимается. DHCPv6, QUIC и WireGuard по-прежнему только по порту.
+- `Udp.msg` — подтверждение тела. DNS/mDNS/LLMNR: первое имя вопроса (сжатие указателями, не длиннее 64 символов); вопросов нет — ярлык остаётся без имени. Первая SRV в ответах: порт и целевой хост; приоритет и вес не читаются. SRV короче 7 байт или с именем вне rdata пропускается, обрезанный ответ не даёт порт. DHCP: magic cookie `63825363`. Опция 53 — тип, опция 12 — hostname (не длиннее 64, непечатное становится `?`), опция 50 — запрошенный адрес (ровно 4 байта). SSDP: первая строка `M-SEARCH`, `NOTIFY` или `HTTP/1.x`; заголовки `NT`, `USN`, `LOCATION` (не длиннее 128, пробел сохраняется, прочее непечатное — `?`). Cookie нет, имя DNS битое или тело не SSDP — ярлык снимается. DHCPv6: первый байт — тип 1–13. Типы 1–11 не короче 4 байт, relay 12–13 не короче 34. Иначе ярлык снимается. Transaction-id и опции не читаются. NBNS (UDP 137): первая метка — 32 символа `A`–`P`. Имя (15 байт без хвостовых пробелов), суффикс, NB или NBSTAT, код операции. Ответ: код результата и IPv4 первой целой NB-записи (6 байт). Иначе ярлык снимается. Запрос и ответ не связываются. QUIC и WireGuard по-прежнему только по порту.
 - `Igmp` — v1/v2/v3. Query `0x11`: короче 8 байт → `IgmpType::Query`; ровно 8 и Max Resp = 0 → v1; ровно 8 и Max Resp ≠ 0 → v2; длиннее 8 → v3. `Igmp_Broken` несёт `igmp_type`.
-- `Icmp6` — Echo, ошибки пути, NDP (RS/RA/NS/NA/Redirect), MLD 130–132 и MLDv2 143. Options NDP и записи MLDv2 не разбираются. `Icmp6_Broken` несёт `icmp6_type`.
+- `Icmp6` — Echo, ошибки пути, NDP (RS/RA/NS/NA/Redirect), MLD 130–132 и MLDv2 143. У NS — Source LLA (MAC спрашивающего), у NA — Target LLA (MAC объявляемого соседа). Остальные options NDP и записи MLDv2 не разбираются. `Icmp6_Broken` несёт `icmp6_type`.
 - `Icmp4` — Echo, Dest Unreach (у code 4 ещё MTU), Time Exceeded, Parameter Problem, Redirect, Timestamp, RA/RS. Вложенная дейтаграмма и список адресов RA не читаются. Короче 8 байт или Timestamp не из 20 байт → `Icmp4_Broken` с `icmp4_type`.
 - `Esp` — протокол 50, только SPI. Короче 8 байт → `Esp_Broken`. UDP/4500 остаётся `UdpApp::EspOverUdp`. Ciphertext не читается.
 
@@ -41,17 +41,13 @@ ICMPv4: Echo, Dest Unreach, Redirect, Time Exceeded, Parameter Problem и Timest
 
 **TODO, локальная сеть** — следующий разбор, в этом порядке:
 
-1. MAC соседа в NDP options у NS и NA.
-2. DHCPv4: hostname (опция 12) и запрошенный адрес.
-3. SSDP (UDP 1900): первая строка и поля `NT`, `USN`, `LOCATION`.
-4. mDNS: тип сервиса (PTR/SRV), не только первое имя вопроса.
-5. DHCPv6 (546/547): тип сообщения — первый байт.
+1. mDNS: тип сервиса PTR и метки `_service._proto`. Порт и хост первой SRV уже читаются.
 
-Если такой трафик есть в сети: NetBIOS Name Service (UDP 137); BPDU STP/RSTP (LLC DSAP/SSAP `0x42`, не SNAP); проверка заголовка WireGuard на UDP 51820.
+Если такой трафик есть в сети: BPDU STP/RSTP (LLC DSAP/SSAP `0x42`, не SNAP); проверка заголовка WireGuard на UDP 51820.
 
 **Хвост по-прежнему не читается:**
 
-- Остальные NDP options у RA, NS и NA (префиксы, DNS). MAC соседа — пункт 1 выше.
+- Остальные NDP options у RA, NS и NA (префиксы, DNS). MAC соседа у NS (source LLA) и NA (target LLA) читается.
 - Список адресов ICMPv4 Router Advertisement.
 - Записи и списки источников MLDv2 Report: вариант `MldV2Report` пустой.
 - Списки источников IGMP v3 обрезаются: не больше 16 адресов и 8 записей групп.

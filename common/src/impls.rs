@@ -149,6 +149,54 @@ impl Dhcp4Msg {
     }
 }
 
+impl Dhcp6Msg {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        Some(match v {
+            1  => Dhcp6Msg::Solicit,
+            2  => Dhcp6Msg::Advertise,
+            3  => Dhcp6Msg::Request,
+            4  => Dhcp6Msg::Confirm,
+            5  => Dhcp6Msg::Renew,
+            6  => Dhcp6Msg::Rebind,
+            7  => Dhcp6Msg::Reply,
+            8  => Dhcp6Msg::Release,
+            9  => Dhcp6Msg::Decline,
+            10 => Dhcp6Msg::Reconfigure,
+            11 => Dhcp6Msg::InformationRequest,
+            12 => Dhcp6Msg::RelayForw,
+            13 => Dhcp6Msg::RelayRepl,
+            _  => return None,
+        })
+    }
+
+    pub fn is_relay(self) -> bool {
+        matches!(self, Dhcp6Msg::RelayForw | Dhcp6Msg::RelayRepl)
+    }
+}
+
+impl NbnsOp {
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            0 => NbnsOp::Query,
+            5 => NbnsOp::Registration,
+            6 => NbnsOp::Release,
+            7 => NbnsOp::Wack,
+            8 => NbnsOp::Refresh,
+            other => NbnsOp::Other(other),
+        }
+    }
+}
+
+impl NbnsKind {
+    pub fn from_u16(v: u16) -> Option<Self> {
+        match v {
+            0x0020 => Some(NbnsKind::Nb),
+            0x0021 => Some(NbnsKind::NbStat),
+            _ => None,
+        }
+    }
+}
+
 impl UdpApp {
     /// Ярлык по src или dst. Более специфичный выигрывает (DHCP/mDNS раньше QUIC).
     pub fn from_ports(src: u16, dst: u16) -> Self {
@@ -165,6 +213,7 @@ impl UdpApp {
             1900      => UdpApp::Ssdp,
             53        => UdpApp::Dns,
             5355      => UdpApp::Llmnr,
+            137       => UdpApp::Nbns,
             123       => UdpApp::Ntp,
             443       => UdpApp::Quic,
             51820     => UdpApp::Wireguard,
@@ -175,9 +224,9 @@ impl UdpApp {
 
     fn rank(self) -> u8 {
         match self {
-            UdpApp::Dhcp4 | UdpApp::Dhcp6 | UdpApp::Mdns | UdpApp::Ssdp => 0,
-            UdpApp::Dns | UdpApp::Llmnr | UdpApp::Ntp => 1,
-            UdpApp::Quic | UdpApp::Wireguard | UdpApp::EspOverUdp => 2,
+            UdpApp::Dhcp4 | UdpApp::Dhcp6     | UdpApp::Mdns | UdpApp::Ssdp => 0,
+            UdpApp::Dns   | UdpApp::Llmnr     | UdpApp::Ntp  | UdpApp::Nbns => 1,
+            UdpApp::Quic  | UdpApp::Wireguard | UdpApp::EspOverUdp          => 2,
             UdpApp::Other => 3,
         }
     }
@@ -203,7 +252,7 @@ impl Icmp4Type {
             ICMP4_TYPE_PARAM_PROBLEM   => Icmp4Type::ParamProblem,
             ICMP4_TYPE_TIMESTAMP       => Icmp4Type::Timestamp,
             ICMP4_TYPE_TIMESTAMP_REPLY => Icmp4Type::TimestampReply,
-            other                      => Icmp4Type::Unknown(other),
+            other                  => Icmp4Type::Unknown(other),
         }
     }
 
@@ -219,7 +268,7 @@ impl Icmp4Type {
             Icmp4Type::ParamProblem        => ICMP4_TYPE_PARAM_PROBLEM,
             Icmp4Type::Timestamp           => ICMP4_TYPE_TIMESTAMP,
             Icmp4Type::TimestampReply      => ICMP4_TYPE_TIMESTAMP_REPLY,
-            Icmp4Type::Unknown(t)          => t,
+            Icmp4Type::Unknown(t)      => t,
         }
     }
 }
@@ -227,17 +276,17 @@ impl Icmp4Type {
 impl Icmp4Data {
     pub fn icmp4_type(&self) -> Icmp4Type {
         match self {
-            Icmp4Data::EchoRequest { .. }         => Icmp4Type::EchoRequest,
-            Icmp4Data::EchoReply { .. }           => Icmp4Type::EchoReply,
-            Icmp4Data::DestUnreach { .. }         => Icmp4Type::DestUnreach,
-            Icmp4Data::TimeExceeded { .. }        => Icmp4Type::TimeExceeded,
-            Icmp4Data::ParamProblem { .. }        => Icmp4Type::ParamProblem,
-            Icmp4Data::Redirect { .. }            => Icmp4Type::Redirect,
-            Icmp4Data::Timestamp { .. }           => Icmp4Type::Timestamp,
-            Icmp4Data::TimestampReply { .. }      => Icmp4Type::TimestampReply,
-            Icmp4Data::RouterAdvertisement { .. } => Icmp4Type::RouterAdvertisement,
-            Icmp4Data::RouterSolicitation        => Icmp4Type::RouterSolicitation,
-            Icmp4Data::Unknown { type_u8, .. }    => Icmp4Type::Unknown(*type_u8),
+            Icmp4Data::EchoRequest { .. }            => Icmp4Type::EchoRequest,
+            Icmp4Data::EchoReply { .. }              => Icmp4Type::EchoReply,
+            Icmp4Data::DestUnreach { .. }            => Icmp4Type::DestUnreach,
+            Icmp4Data::TimeExceeded { .. }           => Icmp4Type::TimeExceeded,
+            Icmp4Data::ParamProblem { .. }           => Icmp4Type::ParamProblem,
+            Icmp4Data::Redirect { .. }               => Icmp4Type::Redirect,
+            Icmp4Data::Timestamp { .. }              => Icmp4Type::Timestamp,
+            Icmp4Data::TimestampReply { .. }         => Icmp4Type::TimestampReply,
+            Icmp4Data::RouterAdvertisement { .. }    => Icmp4Type::RouterAdvertisement,
+            Icmp4Data::RouterSolicitation            => Icmp4Type::RouterSolicitation,
+            Icmp4Data::Unknown { type_u8, .. }  => Icmp4Type::Unknown(*type_u8),
         }
     }
 }
@@ -267,7 +316,7 @@ impl Icmp6Type {
             ICMP6_TYPE_NA             => Icmp6Type::NeighborAdvertisement,
             ICMP6_TYPE_REDIRECT       => Icmp6Type::Redirect,
             ICMP6_TYPE_MLDV2_REPORT   => Icmp6Type::MldV2Report,
-            other                     => Icmp6Type::Unknown(other),
+            other                 => Icmp6Type::Unknown(other),
         }
     }
 
@@ -288,7 +337,7 @@ impl Icmp6Type {
             Icmp6Type::NeighborAdvertisement=> ICMP6_TYPE_NA,
             Icmp6Type::Redirect             => ICMP6_TYPE_REDIRECT,
             Icmp6Type::MldV2Report          => ICMP6_TYPE_MLDV2_REPORT,
-            Icmp6Type::Unknown(t)           => t,
+            Icmp6Type::Unknown(t)       => t,
         }
     }
 }
@@ -311,7 +360,7 @@ impl Icmp6Data {
             Icmp6Data::MldReport { .. }              => Icmp6Type::MldReport,
             Icmp6Data::MldDone { .. }                => Icmp6Type::MldDone,
             Icmp6Data::MldV2Report                   => Icmp6Type::MldV2Report,
-            Icmp6Data::Unknown { type_u8, .. }       => Icmp6Type::Unknown(*type_u8),
+            Icmp6Data::Unknown { type_u8, .. }  => Icmp6Type::Unknown(*type_u8),
         }
     }
 }
@@ -338,7 +387,7 @@ impl IgmpType {
             IGMP_TYPE_V2_REPORT => IgmpType::V2Report,
             IGMP_TYPE_V2_LEAVE  => IgmpType::V2Leave,
             IGMP_TYPE_V3_REPORT => IgmpType::V3Report,
-            other               => IgmpType::Unknown(other),
+            other           => IgmpType::Unknown(other),
         }
     }
 
