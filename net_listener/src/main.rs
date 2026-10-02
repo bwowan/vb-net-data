@@ -10,10 +10,13 @@ use anyhow::Result;
 use pcap;
 //use scopeguard::defer;
 //use std::sync::{Arc, AtomicBool}
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 mod capture;
+mod console;
 mod parser;
+#[allow(dead_code)]
 mod statistic;
 use tracing_subscriber;
 
@@ -90,7 +93,11 @@ fn select_network_device() -> Result<pcap::Device> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    let log_file = std::fs::File::create("/tmp/net_listener.log")?;
+    tracing_subscriber::fmt()
+        .with_writer(log_file)
+        .with_ansi(false)
+        .init();
 
     // 1. Выбираем сетевое устройство.
     let net_device = match select_network_device() {
@@ -116,7 +123,8 @@ async fn main() -> Result<()> {
     let num_parsers = 1;
     let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::with_capacity(num_parsers+2);
     let (cap2parse_tx, cap2parse_rx) = flume::bounded::<common::CapData>(1024);
-    let (parse2stats_tx, parse2stats_rx) = flume::bounded::<common::NetData>(1024);
+    // Кольцо на 1024 — окно отставания. send не блокирует парсер.
+    let (broadcaster, stats_rx) = tokio::sync::broadcast::channel::<Arc<common::NetData>>(1024);
 
     {   //here we made isolation of chanells, so it lives only in these threads
 
@@ -133,21 +141,28 @@ async fn main() -> Result<()> {
         //start a few parsers tasks
         //for _ in 0..num_parsers {
             //let rx = cap2parse_rx;
-            let tx = parse2stats_tx.clone();
-            handles.push( tokio::spawn(async move {parser::parse_loop(own_mac, cap2parse_rx, tx).await;} ) );
+            handles.push( tokio::spawn(async move {parser::parse_loop(own_mac, cap2parse_rx, broadcaster).await;} ) );
         //}
 
-        //start statistic task
-        {   let rx = parse2stats_rx;
-            handles.push( tokio::spawn(async move {statistic::console_statistic(rx).await}) );
+    }
+
+    let console_shutdown = shutdown_flag.clone();
+    let console_handle = std::thread::spawn(move || console::run(stats_rx, console_shutdown));
+
+    loop {
+        if console_handle.is_finished() {
+            break;
+        }
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                shutdown_flag.store(true, Ordering::Relaxed);
+                break;
+            }
+            _ = tokio::time::sleep(Duration::from_millis(80)) => {}
         }
     }
-    
-
-    // Ожидаем сигнала Ctrl-C для грациозного завершения
-    println!("Packet listener started. Press Ctrl-C to stop.");
-    tokio::signal::ctrl_c().await?;
-    println!("\nCtrl-C received, initiating graceful shutdown...");
+    shutdown_flag.store(true, Ordering::Relaxed);
+    let _ = tokio::task::spawn_blocking(move || console_handle.join()).await;
 
     // Ожидаем, пока все задачи завершатся самостоятельно, получив сигнал
     // о закрытии каналов.

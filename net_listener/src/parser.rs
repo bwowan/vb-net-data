@@ -4,7 +4,10 @@ use common::{self};
 use pnet_datalink;
 use etherparse;
 use std::cmp::min;
+use std::sync::Arc;
+use tokio::sync::broadcast;
 use tokio::time::{self, Duration};
+use tracing::info;
 //use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 pub fn get_mac_address(device_name: &str) -> Option<common::MacAddr6> {
@@ -18,45 +21,41 @@ pub fn get_mac_address(device_name: &str) -> Option<common::MacAddr6> {
 
 pub async fn parse_loop(own_mac : common::MacAddr6,
                         receiver: flume::Receiver<common::CapData>,
-                        _sender : flume::Sender<common::NetData>)
+                        sender : broadcast::Sender<Arc<common::NetData>>)
 {
     let mut interval = time::interval(Duration::from_secs(2));
     interval.tick().await;
 
     // Цикл будет работать, пока канал-приемник открыт и поставляет данные.
     // recv_async().await вернет Err, когда все отправители будут уничтожены.
-    println!("PARSER: enter parsing");
+    info!("PARSER: enter parsing");
     loop {
-        //println!("PARSER: start loop");
-        //println!(" Receiver --> disConnected_{} empty_{} full_{}, len:{}, cap:{}, s_cnt:{}, r_cnt:{}",
-        //        receiver.is_disconnected(), receiver.is_empty(), receiver.is_full(), 
-        //         receiver.len(), receiver.capacity().unwrap_or(9999), receiver.sender_count(), receiver.receiver_count());
         match receiver.recv_async().await {
             Err(e) => {
-                println!("PARSER: error read from receiver - {:?}", e);
+                eprintln!("PARSER: error read from receiver - {e:?}");
                 break;
             }
             Ok(data) => {
+                // Кадр с захвата снимается в любом случае. Без подписчиков разбор не нужен:
+                // send всё равно некуда класть, а очередь захвата не должна вставать.
+                if sender.receiver_count() == 0 {
+                    continue;
+                }
                 match parse_ethernet_packet(data, own_mac) {
-                    Ok(_net_data) => {
-                        //println!("[parser] {}", net_data);
-                        /*match sender.send_async(net_data).await {
-                            Ok(_) => {},
-                            Err(e) => {
-                                println!("[parser] Downstream receiver gone, stopping {:?}.", e);
-                                break;
-                            }
-                        }*/
+                    Ok(net_data) => {
+                        // send синхронный: парсер не ждёт, пока подписчики прочитают кадр.
+                        // Ошибка — подписчики успели уйти между проверкой и отправкой.
+                        let _ = sender.send(Arc::new(net_data));
                     }
                     Err(e) => {
-                        println!("[parser] {:?}", e);
+                        eprintln!("[parser] {e:?}");
                         continue;
                     }
                 }
             }
         }
     }
-    println!("PARSER: leave parsing");
+    info!("PARSER: leave parsing");
 }
 
 
@@ -101,7 +100,7 @@ fn get_direction(src: &common::MacAddr6, dst: &common::MacAddr6, own_mac: &commo
 // ── Ethernet ────────────────────────────────────────────────────────────────
 fn parse_ethernet_packet(data: common::CapData, own_mac: common::MacAddr6) -> Result<common::NetData, common::ParseError> {
     let (eth_header, eth_payload) = etherparse::Ethernet2Header::from_slice(&data.data).map_err(|e| {
-            println!("{:?}", e);
+            eprintln!("{e:?}");
             common::ParseError::Eth_Broken { len: data.data.len() }
         })?;
     
@@ -122,23 +121,17 @@ fn parse_ethernet_packet(data: common::CapData, own_mac: common::MacAddr6) -> Re
     };
     match result {
         Ok(r) => {
-                let eth_data = common::EthData { src, dst, dir, prot};
-                let result  = common::NetData { eth: eth_data, payload: r };
-                if prot != common::EthType::Ipv4  //&&  prot != common::EthType::Ipv6
-                {
-                    println!("{}", result);
-                }
-                Ok(result)
-            },
+            let eth_data = common::EthData { src, dst, dir, prot };
+            Ok(common::NetData { eth: eth_data, payload: r })
+        }
         Err(e) => {
-            //println!("PARSER: error parse ethernet packet - {:?}", e);
             let dump_len = min(128, data.data.len());
-            println!("PARSER: packet {} bytes, first {}:", data.data.len(), dump_len);
+            eprintln!("PARSER: packet {} bytes, first {}:", data.data.len(), dump_len);
             for (i, b) in data.data[..dump_len].iter().enumerate() {
                 if i % 16 == 0 {
-                    print!("  {:04x}: ", i);
+                    eprint!("  {i:04x}: ");
                 }
-                print!("{:02x}{}", b, if i % 16 == 15 || i + 1 == dump_len { "\n" } else { " " });
+                eprint!("{:02x}{}", b, if i % 16 == 15 || i + 1 == dump_len { "\n" } else { " " });
             }
             Err(e)
         }

@@ -1,8 +1,10 @@
+use std::sync::Arc;
+
 use common;
-use flume;
+use tokio::sync::broadcast;
 use tokio::time::{self, Duration};
 
-pub async fn console_statistic(receiver: flume::Receiver<common::NetData>) 
+pub async fn console_statistic(mut receiver: broadcast::Receiver<Arc<common::NetData>>)
 {
     let mut stats = common::TrafficStats::default();
     let mut interval = time::interval(Duration::from_secs(5));
@@ -10,10 +12,10 @@ pub async fn console_statistic(receiver: flume::Receiver<common::NetData>)
 
     loop {
         tokio::select! {
-            result = receiver.recv_async() => {
+            result = receiver.recv() => {
                 match result {
                     Ok(data) => {
-                        let len = match data.payload {
+                        let len = match &data.payload {
                             common::NetPayload::Ip(ip) => ip.len,
                             _ => 0,
                         };
@@ -28,8 +30,10 @@ pub async fn console_statistic(receiver: flume::Receiver<common::NetData>)
                             }
                         }
                     }
-                    Err(_) => {
-                        // Канал закрыт, выводим итоговую статистику
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        // Кольцо перезаписало кадры, пока этот подписчик отставал.
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
                         print_stats(&stats);
                         break;
                     }
