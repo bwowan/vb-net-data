@@ -7,6 +7,8 @@ use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use crate::pool;
+
 
 use common::{
     ArpData, EDirection, EthData, EthType, IpData, IpL4, MacAddr6, NetData, NetPayload, UdpApp,
@@ -25,7 +27,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 use ratatui::Terminal;
-use tokio::sync::broadcast;
+use flume;
 
 const FLOW_CAP   : usize    = 4096;
 const ADDR_CAP   : usize    = 4096;
@@ -464,7 +466,7 @@ struct Model {
     redraw:        bool,
 }
 
-pub fn run(mut rx: broadcast::Receiver<Arc<NetData>>, shutdown: Arc<AtomicBool>) {
+pub fn run(mut rx: flume::Receiver<pool::PoolSlot<NetData>>, shutdown: Arc<AtomicBool>) {
     let _guard = scopeguard::guard((), |_| restore_terminal());
     if enable_raw_mode().is_err() {
         return;
@@ -517,13 +519,15 @@ fn restore_terminal() {
     let _ = execute!(out, LeaveAlternateScreen);
 }
 
-fn drain(rx: &mut broadcast::Receiver<Arc<NetData>>, model: &mut Model) -> bool {
+fn drain(rx: &mut flume::Receiver<pool::PoolSlot<NetData>>, model: &mut Model) -> bool {
     for _ in 0..DRAIN_BURST {
         match rx.try_recv() {
-            Ok(pkt) => model.ingest(&pkt),
-            Err(broadcast::error::TryRecvError::Empty) => return true,
-            Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
-            Err(broadcast::error::TryRecvError::Closed) => return false,
+            Ok(slot) => {
+                let data = unsafe { &*slot.body };
+                model.ingest(data);
+            }
+            Err(flume::TryRecvError::Empty) => return true,
+            Err(flume::TryRecvError::Disconnected) => return false,
         }
     }
     true

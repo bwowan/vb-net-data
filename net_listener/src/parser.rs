@@ -4,8 +4,6 @@ use common::{self};
 use pnet_datalink;
 use etherparse;
 use std::cmp::min;
-use std::sync::Arc;
-use tokio::sync::broadcast;
 use tokio::time::{self, Duration};
 use tracing::info;
 //use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -20,8 +18,8 @@ pub fn get_mac_address(device_name: &str) -> Option<common::MacAddr6> {
 
 
 pub async fn parse_loop(own_mac : common::MacAddr6,
-                        receiver: flume::Receiver<common::CapData>,
-                        sender : broadcast::Sender<Arc<common::NetData>>)
+                        receiver: flume::Receiver<(common::CapData, crate::pool::PoolSlot<common::NetData>)>,
+                        sender : flume::Sender<crate::pool::PoolSlot<common::NetData>>)
 {
     let mut interval = time::interval(Duration::from_secs(2));
     interval.tick().await;
@@ -35,17 +33,14 @@ pub async fn parse_loop(own_mac : common::MacAddr6,
                 eprintln!("PARSER: error read from receiver - {e:?}");
                 break;
             }
-            Ok(data) => {
-                // Кадр с захвата снимается в любом случае. Без подписчиков разбор не нужен:
-                // send всё равно некуда класть, а очередь захвата не должна вставать.
-                if sender.receiver_count() == 0 {
+            Ok((data, slot)) => {
+                if sender.is_disconnected() {
                     continue;
                 }
                 match parse_ethernet_packet(data, own_mac) {
                     Ok(net_data) => {
-                        // send синхронный: парсер не ждёт, пока подписчики прочитают кадр.
-                        // Ошибка — подписчики успели уйти между проверкой и отправкой.
-                        let _ = sender.send(Arc::new(net_data));
+                        unsafe { std::ptr::write(slot.body, net_data); }
+                        let _ = sender.try_send(slot);
                     }
                     Err(e) => {
                         eprintln!("[parser] {e:?}");

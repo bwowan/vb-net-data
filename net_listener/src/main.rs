@@ -11,18 +11,23 @@ use pcap;
 //use scopeguard::defer;
 //use std::sync::{Arc, AtomicBool}
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 mod capture;
 mod console;
 mod parser;
-#[allow(dead_code)]
 mod pool;
+
 #[allow(dead_code)]
 mod statistic;
 use tracing_subscriber;
 
 //use statistic::run_stats_aggregator;
+
+const POOL_COUNT: usize = 1024;
+
+static CAP_POOL: LazyLock<Box<pool::MemPool<common::NetData, POOL_COUNT>>> =
+    LazyLock::new(|| Box::new(pool::MemPool::new()));
 
 static SOCKET_PATH: &str = "/tmp/net_listener_stats2.sock";
 /// Unix-сокет для отдачи статистики наружу. При Drop файл сокета удаляется.
@@ -183,7 +188,6 @@ async fn main() -> Result<()> {
         .unwrap_or(1);
     println!("Logical cores: {cores}; parser tasks: {num_parsers}");
 
-    // .ok_or_else() - более идиоматичный способ преобразовать Option в Result
     let channels = MainChannels::new();
     if channels.is_none() {
         println!("Failed to initialize channels.");
@@ -192,59 +196,57 @@ async fn main() -> Result<()> {
 
     let shutdown_flag: Arc<_> = Arc::new(AtomicBool::new(false));
 
-    // Вектор для хранения JoinHandle всех запущенных задач
-    let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::with_capacity(num_parsers+2);
-    let (cap2parse_tx, cap2parse_rx) = flume::bounded::<common::CapData>(1024);
-    // Кольцо на 1024 — окно отставания. send не блокирует парсер.
-    let (broadcaster, stats_rx) = tokio::sync::broadcast::channel::<Arc<common::NetData>>(1024);
+    //create pipes capture->parser->client
+    let (from_capture_to_parser_sender, from_capture_to_parser_receiver) =
+        flume::bounded::<(common::CapData, pool::PoolSlot<common::NetData>)>(1024);
+    let (from_parser_to_client_sender, from_parser_to_client_receiver) =
+        flume::bounded::<pool::PoolSlot<common::NetData>>(POOL_COUNT);
 
-    {   //here we made isolation of chanells, so it lives only in these threads
+    let pool_clients_number = 1u8;
+    let mut client_handles: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(pool_clients_number as usize);
+    client_handles.push(std::thread::spawn( { let shutdown_flag = shutdown_flag.clone();
+                                              move || console::run(from_parser_to_client_receiver, shutdown_flag)
+                                            } )
+                        );
 
-        //start single capture task
-        handles.push(   {   let dev = net_device.clone();
-                            //let tx = cap2parse_tx;
-                            let sh = shutdown_flag.clone();
-                            tokio::task::spawn_blocking(move || {
-                                capture::capture_loop(dev, cap2parse_tx, sh)
-                            })
-                        }
-        );  
+    let capture_handle = {
+        let dev = net_device.clone();
+        let sh = shutdown_flag.clone();
+        let pool = &**CAP_POOL;
+        tokio::task::spawn_blocking(move || {
+            capture::capture_loop(
+                dev,
+                from_capture_to_parser_sender,
+                sh,
+                pool,
+                pool,
+                pool_clients_number,
+            )
+        })
+    };
 
-        //start a few parsers tasks
-        for _ in 0..num_parsers {
-            let rx = cap2parse_rx.clone();
-            let tx = broadcaster.clone();
-            handles.push(tokio::spawn(async move {
-                parser::parse_loop(own_mac, rx, tx).await;
-            }));
-        }
-
+    let mut parsers_handles: Vec<tokio::task::JoinHandle<()>> = Vec::with_capacity(num_parsers);
+    for _ in 0..num_parsers {
+        let rx = from_capture_to_parser_receiver.clone();
+        let tx = from_parser_to_client_sender.clone();
+        parsers_handles.push(tokio::spawn(async move { parser::parse_loop(own_mac, rx, tx).await }));
     }
 
-    let console_shutdown = shutdown_flag.clone();
-    let console_handle = std::thread::spawn(move || console::run(stats_rx, console_shutdown));
-
-    loop {
-        if console_handle.is_finished() {
-            break;
-        }
+    while !shutdown_flag.load(Ordering::Relaxed) {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                shutdown_flag.store(true, Ordering::Relaxed);
-                break;
-            }
-            _ = tokio::time::sleep(Duration::from_millis(80)) => {}
+            _ = tokio::signal::ctrl_c()                        => shutdown_flag.store(true, Ordering::Relaxed),
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
         }
     }
-    shutdown_flag.store(true, Ordering::Relaxed);
-    let _ = tokio::task::spawn_blocking(move || console_handle.join()).await;
 
-    // Ожидаем, пока все задачи завершатся самостоятельно, получив сигнал
-    // о закрытии каналов.
     println!("Waiting for tasks to finish...");
-    for handle in handles {
-        handle.await?;
+    let _ = capture_handle.await;
+    for handle in parsers_handles {
+        let _ = handle.await;
+    }
+    for handle in client_handles {
+        let _ = handle.join();
     }
 
-    Ok(())
+    Ok(()) 
 }
