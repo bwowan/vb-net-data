@@ -377,16 +377,20 @@ pub struct NbnsMsg {
 /// DNS, mDNS или LLMNR.
 /// `name` — первое имя вопроса, если вопросы есть.
 /// `srv` — порт и хост первой записи SRV в ответах.
+/// `service` и `ptr` заполняются только у mDNS: две метки `_service._proto` и имя первой PTR.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct DnsQuery {
     pub name: Option<heapless::String<UDP_QNAME_MAX>>,
     pub srv: Option<SrvHost>,
+    pub service: Option<heapless::String<UDP_QNAME_MAX>>,
+    pub ptr: Option<heapless::String<UDP_QNAME_MAX>>,
 }
 
 /// Что удалось прочитать из тела UDP. Ярлык `UdpApp` при этом уже подтверждён.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum UdpMsg {
     /// Имя вопроса и, если в ответах есть SRV, её порт и хост.
+    /// У mDNS ещё `service` (`_service._proto`) и имя первой PTR.
     Query(DnsQuery),
     /// DHCPv6: первый байт — известный тип, длина заголовка достаточная.
     Dhcp6 { msg: Dhcp6Msg },

@@ -18,8 +18,8 @@ pub fn get_mac_address(device_name: &str) -> Option<common::MacAddr6> {
 
 
 pub async fn parse_loop(own_mac : common::MacAddr6,
-                        receiver: flume::Receiver<(common::CapData, crate::pool::PoolSlot<common::NetData>)>,
-                        sender : flume::Sender<crate::pool::PoolSlot<common::NetData>>)
+                        receiver: flume::Receiver<(common::CapData, mempool::PoolSlot<common::NetData>)>,
+                        sender  : flume::Sender<mempool::PoolSlot<common::NetData>>)
 {
     let mut interval = time::interval(Duration::from_secs(2));
     interval.tick().await;
@@ -35,7 +35,8 @@ pub async fn parse_loop(own_mac : common::MacAddr6,
             }
             Ok((data, slot)) => {
                 if sender.is_disconnected() {
-                    continue;
+                    info!("PARSER: clients dropped, stop parsing");
+                    break;
                 }
                 match parse_ethernet_packet(data, own_mac) {
                     Ok(net_data) => {
@@ -303,7 +304,8 @@ fn udp_payload_slice(length: u16, rest: &[u8]) -> &[u8] {
     if declared <= rest.len() { &rest[..declared] } else { rest }
 }
 
-/// DNS/mDNS/LLMNR: первое имя вопроса и первая SRV в ответах. DHCP: magic cookie, опции 53, 12 и 50.
+/// DNS/mDNS/LLMNR: первое имя вопроса и первая SRV в ответах.
+/// mDNS ещё: метки `_service._proto` и первая PTR. DHCP: magic cookie, опции 53, 12 и 50.
 /// DHCPv6: первый байт — тип. NBNS: имя из 32 символов A–P. SSDP: первая строка и заголовки NT, USN, LOCATION.
 /// Тело не сошлось — ярлык по порту снимается, пакет остаётся обычным UDP.
 fn confirm_udp_body(data: &mut common::IpData, body: &[u8]) {
@@ -326,7 +328,13 @@ fn confirm_udp_body(data: &mut common::IpData, body: &[u8]) {
             None => *app = common::UdpApp::Other,
         },
         common::UdpApp::Dns | common::UdpApp::Mdns | common::UdpApp::Llmnr => match parse_dns_msg(body) {
-            Ok(Some(q)) => *msg = Some(common::UdpMsg::Query(q)),
+            Ok(Some(mut q)) => {
+                if *app != common::UdpApp::Mdns {
+                    q.service = None;
+                    q.ptr = None;
+                }
+                *msg = Some(common::UdpMsg::Query(q));
+            }
             Ok(None) => {}
             Err(()) => *app = common::UdpApp::Other,
         },
@@ -336,6 +344,7 @@ fn confirm_udp_body(data: &mut common::IpData, body: &[u8]) {
 
 const DNS_HEADER_LEN: usize = 12;
 const DNS_PTR_HOPS: usize = 8;
+const DNS_TYPE_PTR: u16 = 12;
 const DNS_TYPE_SRV: u16 = 33;
 const DNS_SRV_FIXED: usize = 6; // priority, weight, port
 const NBNS_TYPE_NB: u16 = 0x0020;
@@ -352,9 +361,10 @@ const DHCP4_OPT_PAD: u8 = 0;
 const DHCP6_MSG_MIN: usize = 4;   // type + transaction-id
 const DHCP6_RELAY_MIN: usize = 34; // type, hop-count, link-address, peer-address
 
-/// `Ok(None)` — заголовок есть, ни вопроса, ни целой SRV. `Err` — битое первое имя вопроса.
+/// `Ok(None)` — заголовок есть, ни вопроса, ни целой SRV, ни целой PTR. `Err` — битое первое имя вопроса.
 /// Первая SRV в ответах: порт и целевой хост. Короче 7 байт или имя вне rdata — запись пропускается.
-/// Обрезанный ответ останавливает обход: уже прочитанный вопрос сохраняется, порт не выдумывается.
+/// Первая PTR: имя из rdata. `service` — первые метки `_service._proto` (вопрос, затем владелец PTR, rdata PTR, владелец SRV).
+/// Обрезанный ответ останавливает обход: уже прочитанные вопрос, PTR и SRV сохраняются, недостающее не выдумывается.
 fn parse_dns_msg(body: &[u8]) -> Result<Option<common::DnsQuery>, ()> {
     if body.len() < DNS_HEADER_LEN {
         return Err(());
@@ -363,26 +373,44 @@ fn parse_dns_msg(body: &[u8]) -> Result<Option<common::DnsQuery>, ()> {
     let an = u16::from_be_bytes([body[6], body[7]]);
     let mut pos = DNS_HEADER_LEN;
     let mut name = None;
+    let mut service = None;
     if qd > 0 {
         let (n, end) = read_dns_name(body, pos)?;
         if end + 4 > body.len() {
             return Err(());
         }
+        service = mdns_service(&n);
         name = Some(n);
         pos = end + 4;
         for _ in 1..qd {
             let Some(next) = skip_dns_question(body, pos) else {
-                return Ok(Some(common::DnsQuery { name, srv: None }));
+                return Ok(Some(common::DnsQuery { name, srv: None, service, ptr: None }));
             };
             pos = next;
         }
     }
-    let srv = dns_first_srv(body, pos, an);
-    if name.is_none() && srv.is_none() {
+    let found = dns_answers(body, pos, an);
+    if service.is_none() {
+        service = found.ptr_owner.as_ref().and_then(|n| mdns_service(n));
+    }
+    if service.is_none() {
+        service = found.ptr.as_ref().and_then(|n| mdns_service(n));
+    }
+    if service.is_none() {
+        service = found.srv_owner.as_ref().and_then(|n| mdns_service(n));
+    }
+    if name.is_none() && found.srv.is_none() && found.ptr.is_none() {
         Ok(None)
     } else {
-        Ok(Some(common::DnsQuery { name, srv }))
+        Ok(Some(common::DnsQuery { name, srv: found.srv, service, ptr: found.ptr }))
     }
+}
+
+struct DnsAnswers {
+    srv: Option<common::SrvHost>,
+    ptr: Option<heapless::String<{ common::UDP_QNAME_MAX }>>,
+    ptr_owner: Option<heapless::String<{ common::UDP_QNAME_MAX }>>,
+    srv_owner: Option<heapless::String<{ common::UDP_QNAME_MAX }>>,
 }
 
 fn skip_dns_question(body: &[u8], pos: usize) -> Option<usize> {
@@ -391,27 +419,73 @@ fn skip_dns_question(body: &[u8], pos: usize) -> Option<usize> {
     if next > body.len() { None } else { Some(next) }
 }
 
-/// Первая целая SRV среди `an` записей с позиции `pos`. Приоритет и вес не читаются.
-fn dns_first_srv(body: &[u8], mut pos: usize, an: u16) -> Option<common::SrvHost> {
+/// Первые целые PTR и SRV среди `an` записей с позиции `pos`. Приоритет и вес SRV не читаются.
+/// Обрезанная запись останавливает обход и оставляет уже найденное.
+fn dns_answers(body: &[u8], mut pos: usize, an: u16) -> DnsAnswers {
+    let mut found = DnsAnswers { srv: None, ptr: None, ptr_owner: None, srv_owner: None };
     for _ in 0..an {
-        let (_, name_end) = read_dns_name(body, pos).ok()?;
+        if found.srv.is_some() && found.ptr.is_some() {
+            break;
+        }
+        let Ok((owner, name_end)) = read_dns_name(body, pos) else {
+            break;
+        };
         if name_end + 10 > body.len() {
-            return None;
+            break;
         }
         let rr_type = u16::from_be_bytes([body[name_end], body[name_end + 1]]);
         let rdlen = u16::from_be_bytes([body[name_end + 8], body[name_end + 9]]) as usize;
         let rdata = name_end + 10;
         if rdata + rdlen > body.len() {
-            return None;
+            break;
         }
-        if rr_type == DNS_TYPE_SRV {
+        if rr_type == DNS_TYPE_SRV && found.srv.is_none() {
             if let Some(srv) = parse_srv_rdata(body, rdata, rdlen) {
-                return Some(srv);
+                found.srv = Some(srv);
+                found.srv_owner = Some(owner);
+            }
+        } else if rr_type == DNS_TYPE_PTR && found.ptr.is_none() {
+            if let Some(target) = parse_ptr_rdata(body, rdata, rdlen) {
+                found.ptr = Some(target);
+                found.ptr_owner = Some(owner);
             }
         }
         pos = rdata + rdlen;
     }
-    None
+    found
+}
+
+fn parse_ptr_rdata(
+    body: &[u8],
+    rdata: usize,
+    rdlen: usize,
+) -> Option<heapless::String<{ common::UDP_QNAME_MAX }>> {
+    if rdlen == 0 {
+        return None;
+    }
+    let (name, end) = read_dns_name(body, rdata).ok()?;
+    if end > rdata + rdlen {
+        return None;
+    }
+    Some(name)
+}
+
+/// Две соседние метки, обе с `_`: `_ipp._tcp` из `_ipp._tcp.local` или `Office._ipp._tcp.local`.
+fn mdns_service(name: &str) -> Option<heapless::String<{ common::UDP_QNAME_MAX }>> {
+    let labels: Vec<&str> = name.split('.').filter(|label| !label.is_empty()).collect();
+    let pair = labels.windows(2).find(|w| w[0].starts_with('_') && w[1].starts_with('_'))?;
+    let mut out = heapless::String::new();
+    for (i, label) in pair.iter().enumerate() {
+        if i > 0 && out.push('.').is_err() {
+            return Some(out);
+        }
+        for c in label.chars() {
+            if out.push(c).is_err() {
+                return Some(out);
+            }
+        }
+    }
+    Some(out)
 }
 
 fn parse_srv_rdata(body: &[u8], rdata: usize, rdlen: usize) -> Option<common::SrvHost> {
@@ -2065,6 +2139,68 @@ mod tests {
         }
     }
 
+    /// `payload_length == 0` не обрезает хвост: len включает байты после TCP.
+    #[test]
+    fn ipv6_zero_payload_length_keeps_tail() {
+        let src = [0x20, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let dst = [0x20, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+        let tcp = tcp_header(50000, 443);
+        let ip = etherparse::Ipv6Header {
+            payload_length: 0,
+            next_header: etherparse::IpNumber::TCP,
+            hop_limit: 64,
+            source: src,
+            destination: dst,
+            ..etherparse::Ipv6Header::default()
+        };
+
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&ip.to_bytes());
+        packet.extend_from_slice(&tcp.to_bytes());
+        packet.extend_from_slice(&[0xBB; 10]);
+
+        let data = expect_ip(parse_ipv6(&packet));
+        match data.l4 {
+            common::IpL4::Tcp { src_port: 50000, dst_port: 443 } => {}
+            other => panic!("expected TCP ports, got {other:?}"),
+        }
+        assert_eq!(data.len, 30);
+    }
+
+    /// Первый IPv6-фрагмент (offset 0, MF=1) сохраняет порты TCP.
+    #[test]
+    fn ipv6_first_fragment_keeps_tcp_ports() {
+        let src = [0x20, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let dst = [0x20, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+        let frag = etherparse::Ipv6FragmentHeader::new(
+            etherparse::IpNumber::TCP,
+            0u16.try_into().unwrap(),
+            true,
+            0xABC,
+        );
+        let tcp = tcp_header(50000, 443);
+        let ip = etherparse::Ipv6Header {
+            payload_length: (etherparse::Ipv6FragmentHeader::LEN + 20) as u16,
+            next_header: etherparse::IpNumber::IPV6_FRAGMENTATION_HEADER,
+            hop_limit: 64,
+            source: src,
+            destination: dst,
+            ..etherparse::Ipv6Header::default()
+        };
+
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&ip.to_bytes());
+        packet.extend_from_slice(&frag.to_bytes());
+        packet.extend_from_slice(&tcp.to_bytes());
+
+        let data = expect_ip(parse_ipv6(&packet));
+        match data.l4 {
+            common::IpL4::Tcp { src_port: 50000, dst_port: 443 } => {}
+            other => panic!("expected TCP ports, got {other:?}"),
+        }
+        assert_eq!(data.len, 20);
+    }
+
     /// IGMPv2 Membership Report: 8 байт, тип 0x16, групповой адрес в payload.
     #[test]
     fn ipv4_igmp_v2_report() {
@@ -2164,6 +2300,79 @@ mod tests {
             Err(common::ParseError::Igmp_Broken { igmp_type: common::IgmpType::V3Query, .. }) => {}
             Err(e) => panic!("expected Igmp_Broken V3Query, got {e:?}"),
             Ok(_) => panic!("expected Igmp_Broken"),
+        }
+    }
+
+    /// IGMPv2 Query: ровно 8 байт и Max Resp Time ≠ 0.
+    #[test]
+    fn ipv4_igmp_v2_query() {
+        let ip = etherparse::Ipv4Header::new(
+            8, 1, etherparse::IpNumber::IGMP, [10, 0, 0, 1], [224, 0, 0, 1],
+        ).unwrap();
+        let igmp = [0x11, 0x0A, 0x12, 0x34, 224, 0, 0, 1];
+
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&ip.to_bytes());
+        packet.extend_from_slice(&igmp);
+
+        let data = expect_ip(parse_ipv4(&packet));
+        match data.l4 {
+            common::IpL4::Igmp(common::IgmpData::V2Query(q)) => {
+                assert_eq!(q.max_resp_time, 0x0A);
+                assert_eq!(q.checksum, 0x1234);
+                assert_eq!(q.group, common::Ipv4Addr::new(224, 0, 0, 1));
+            }
+            other => panic!("expected V2Query, got {other:?}"),
+        }
+    }
+
+    /// IGMPv2 Leave Group: тип 0x17, 8 байт, адрес группы.
+    #[test]
+    fn ipv4_igmp_v2_leave() {
+        let ip = etherparse::Ipv4Header::new(
+            8, 1, etherparse::IpNumber::IGMP, [10, 0, 0, 1], [224, 0, 0, 2],
+        ).unwrap();
+        let igmp = [0x17, 0x00, 0x00, 0x00, 239, 1, 1, 2];
+
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&ip.to_bytes());
+        packet.extend_from_slice(&igmp);
+
+        let data = expect_ip(parse_ipv4(&packet));
+        match data.l4 {
+            common::IpL4::Igmp(common::IgmpData::V2Leave(v)) => {
+                assert_eq!(v.group, common::Ipv4Addr::new(239, 1, 1, 2));
+            }
+            other => panic!("expected V2Leave, got {other:?}"),
+        }
+    }
+
+    /// IGMPv3 Report: одна запись INCLUDE и один источник.
+    #[test]
+    fn ipv4_igmp_v3_report_one_source() {
+        let igmp = [
+            0x22, 0x00, 0x12, 0x34, 0x00, 0x00, 0x00, 0x01,
+            0x01, 0x00, 0x00, 0x01, 239, 1, 1, 1,
+            10, 0, 0, 5,
+        ];
+        let ip = etherparse::Ipv4Header::new(
+            igmp.len() as u16, 1, etherparse::IpNumber::IGMP, [10, 0, 0, 1], [224, 0, 0, 22],
+        ).unwrap();
+
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&ip.to_bytes());
+        packet.extend_from_slice(&igmp);
+
+        let data = expect_ip(parse_ipv4(&packet));
+        match data.l4 {
+            common::IpL4::Igmp(common::IgmpData::V3Report(r)) => {
+                assert_eq!(r.checksum, 0x1234);
+                assert_eq!(r.records.len(), 1);
+                assert_eq!(r.records[0].record_type, common::IgmpV3RecordType::ModeIsInclude);
+                assert_eq!(r.records[0].multicast, common::Ipv4Addr::new(239, 1, 1, 1));
+                assert_eq!(r.records[0].sources.as_slice(), &[common::Ipv4Addr::new(10, 0, 0, 5)]);
+            }
+            other => panic!("expected V3Report, got {other:?}"),
         }
     }
 
@@ -2735,6 +2944,103 @@ Location: http://192.168.0.2/desc.xml\r\n\
         buf.push(0);
     }
 
+    /// Вопрос `_service._proto` даёт метки сервиса. PTR в таком пакете нет.
+    #[test]
+    fn udp_mdns_service_from_question() {
+        let data = ipv4_udp(5353, 5353, &dns_query("_googlecast._tcp.local"));
+        match data.l4.clone() {
+            common::IpL4::Udp { app: common::UdpApp::Mdns, msg: Some(common::UdpMsg::Query(q)), .. } => {
+                assert_eq!(q.name.unwrap().as_str(), "_googlecast._tcp.local");
+                assert_eq!(q.service.unwrap().as_str(), "_googlecast._tcp");
+                assert!(q.ptr.is_none());
+            }
+            other => panic!("expected mDNS service from question, got {other:?}"),
+        }
+        assert!(format!("{}", data).contains("service=_googlecast._tcp"));
+    }
+
+    /// Ответ PTR: имя экземпляра и метки сервиса. Rdata сжата указателем на владельца.
+    #[test]
+    fn udp_mdns_ptr_compressed() {
+        let mut body = vec![0u8; 12];
+        body[7] = 1;
+        let owner_at = body.len();
+        append_dns_name(&mut body, "_ipp._tcp.local");
+        body.extend_from_slice(&[0, 12, 0, 1, 0, 0, 0, 0]);
+        let mut rdata = b"\x06Office".to_vec();
+        rdata.extend_from_slice(&[0xC0, owner_at as u8]);
+        body.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        body.extend_from_slice(&rdata);
+
+        let data = ipv4_udp(5353, 5353, &body);
+        match data.l4.clone() {
+            common::IpL4::Udp { app: common::UdpApp::Mdns, msg: Some(common::UdpMsg::Query(q)), .. } => {
+                assert!(q.name.is_none());
+                assert_eq!(q.ptr.unwrap().as_str(), "Office._ipp._tcp.local");
+                assert_eq!(q.service.unwrap().as_str(), "_ipp._tcp");
+            }
+            other => panic!("expected compressed mDNS PTR, got {other:?}"),
+        }
+        let shown = format!("{}", data);
+        assert!(shown.contains("PTR=Office._ipp._tcp.local"));
+        assert!(shown.contains("service=_ipp._tcp"));
+    }
+
+    /// Битая PTR пропускается. Вопрос остаётся, следующая целая PTR читается.
+    #[test]
+    fn udp_mdns_broken_ptr_skipped() {
+        let mut body = vec![0u8; 12];
+        body[5] = 1;
+        body[7] = 2;
+        append_dns_name(&mut body, "printer.local");
+        body.extend_from_slice(&[0, 12, 0, 1]);
+        body.extend_from_slice(&[0xC0, 12]);
+        body.extend_from_slice(&[0, 12, 0, 1, 0, 0, 0, 0, 0, 1, 0x04]);
+        append_dns_name(&mut body, "_ipp._tcp.local");
+        body.extend_from_slice(&[0, 12, 0, 1, 0, 0, 0, 0]);
+        let mut rdata = Vec::new();
+        append_dns_name(&mut rdata, "Office._ipp._tcp.local");
+        body.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        body.extend_from_slice(&rdata);
+
+        let data = ipv4_udp(5353, 5353, &body);
+        match data.l4.clone() {
+            common::IpL4::Udp { msg: Some(common::UdpMsg::Query(q)), .. } => {
+                assert_eq!(q.name.unwrap().as_str(), "printer.local");
+                assert_eq!(q.ptr.unwrap().as_str(), "Office._ipp._tcp.local");
+                assert_eq!(q.service.unwrap().as_str(), "_ipp._tcp");
+            }
+            other => panic!("expected question and the next PTR, got {other:?}"),
+        }
+    }
+
+    /// DNS/53 с PTR не получает метки сервиса и имя PTR.
+    #[test]
+    fn udp_dns_ptr_stays_without_service() {
+        let mut body = dns_query("_ipp._tcp.local");
+        body[7] = 1;
+        let owner_at = 12u8;
+        body.extend_from_slice(&[0xC0, owner_at, 0, 12, 0, 1, 0, 0, 0, 0]);
+        let mut rdata = b"\x06Office".to_vec();
+        rdata.extend_from_slice(&[0xC0, owner_at]);
+        body.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        body.extend_from_slice(&rdata);
+
+        let data = ipv4_udp(53, 53, &body);
+        match data.l4.clone() {
+            common::IpL4::Udp { app: common::UdpApp::Dns, msg: Some(common::UdpMsg::Query(q)), .. } => {
+                assert_eq!(q.name.unwrap().as_str(), "_ipp._tcp.local");
+                assert!(q.service.is_none());
+                assert!(q.ptr.is_none());
+            }
+            other => panic!("expected DNS without mDNS fields, got {other:?}"),
+        }
+        let shown = format!("{}", data);
+        assert!(shown.contains("q=_ipp._tcp.local"));
+        assert!(!shown.contains("service="));
+        assert!(!shown.contains("PTR="));
+    }
+
     /// Ответ mDNS: порт и хост первой SRV. Приоритет и вес не сохраняются.
     #[test]
     fn udp_mdns_srv_port_and_host() {
@@ -2754,6 +3060,8 @@ Location: http://192.168.0.2/desc.xml\r\n\
         match data.l4.clone() {
             common::IpL4::Udp { msg: Some(common::UdpMsg::Query(q)), .. } => {
                 assert_eq!(q.name.unwrap().as_str(), "_ipp._tcp.local");
+                assert_eq!(q.service.unwrap().as_str(), "_ipp._tcp");
+                assert!(q.ptr.is_none());
                 let srv = q.srv.unwrap();
                 assert_eq!(srv.port, 631);
                 assert_eq!(srv.host.as_str(), "printer.local");
@@ -2781,6 +3089,7 @@ Location: http://192.168.0.2/desc.xml\r\n\
         match data.l4.clone() {
             common::IpL4::Udp { app: common::UdpApp::Mdns, msg: Some(common::UdpMsg::Query(q)), .. } => {
                 assert!(q.name.is_none());
+                assert_eq!(q.service.unwrap().as_str(), "_ipp._tcp");
                 let srv = q.srv.unwrap();
                 assert_eq!(srv.port, 80);
                 assert_eq!(srv.host.as_str(), "office.local");
@@ -3041,6 +3350,61 @@ Location: http://192.168.0.2/desc.xml\r\n\
         }
     }
 
+    /// Packet Too Big: MTU из заголовка.
+    #[test]
+    fn ipv6_icmp_packet_too_big() {
+        let hdr = etherparse::Icmpv6Header::new(etherparse::Icmpv6Type::PacketTooBig { mtu: 1280 });
+        let data = expect_ip(ipv6_l4(etherparse::IpNumber::IPV6_ICMP, &hdr.to_bytes()));
+        assert_eq!(data.l4, common::IpL4::Icmp6(common::Icmp6Data::PacketTooBig { mtu: 1280 }));
+    }
+
+    /// Redirect etherparse отдаёт как Unknown: target и destination из хвоста.
+    #[test]
+    fn ipv6_icmp_redirect() {
+        let target = common::Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+        let destination = common::Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 5);
+        let mut icmp = vec![common::ICMP6_TYPE_REDIRECT, 0, 0, 0, 0, 0, 0, 0];
+        icmp.extend_from_slice(&target.octets());
+        icmp.extend_from_slice(&destination.octets());
+        let data = expect_ip(ipv6_l4(etherparse::IpNumber::IPV6_ICMP, &icmp));
+        match data.l4.clone() {
+            common::IpL4::Icmp6(common::Icmp6Data::Redirect { target: t, destination: d }) => {
+                assert_eq!(t, target);
+                assert_eq!(d, destination);
+            }
+            other => panic!("expected Redirect, got {other:?}"),
+        }
+    }
+
+    /// MLD Report: тип 131, группа в хвосте.
+    #[test]
+    fn ipv6_icmp_mld_report() {
+        let group = common::Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
+        let mut icmp = vec![common::ICMP6_TYPE_MLD_REPORT, 0, 0, 0, 0, 0, 0, 0];
+        icmp.extend_from_slice(&group.octets());
+        let data = expect_ip(ipv6_l4(etherparse::IpNumber::IPV6_ICMP, &icmp));
+        assert_eq!(data.l4, common::IpL4::Icmp6(common::Icmp6Data::MldReport { group }));
+    }
+
+    /// MLD Done: тип 132, группа в хвосте.
+    #[test]
+    fn ipv6_icmp_mld_done() {
+        let group = common::Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 2);
+        let mut icmp = vec![common::ICMP6_TYPE_MLD_DONE, 0, 0, 0, 0, 0, 0, 0];
+        icmp.extend_from_slice(&group.octets());
+        let data = expect_ip(ipv6_l4(etherparse::IpNumber::IPV6_ICMP, &icmp));
+        assert_eq!(data.l4, common::IpL4::Icmp6(common::Icmp6Data::MldDone { group }));
+    }
+
+    /// MLDv2 Report: тип 143, записи не разбираются.
+    #[test]
+    fn ipv6_icmp_mldv2_report_is_empty() {
+        let mut icmp = vec![common::ICMP6_TYPE_MLDV2_REPORT, 0, 0, 0, 0, 0, 0, 1];
+        icmp.extend_from_slice(&[1, 0, 0, 0, 0xff, 0x02]);
+        let data = expect_ip(ipv6_l4(etherparse::IpNumber::IPV6_ICMP, &icmp));
+        assert_eq!(data.l4, common::IpL4::Icmp6(common::Icmp6Data::MldV2Report));
+    }
+
     /// Neighbor Solicitation без target — Icmp6_Broken с типом NS.
     #[test]
     fn ipv6_icmp_ns_truncated() {
@@ -3209,6 +3573,43 @@ Location: http://192.168.0.2/desc.xml\r\n\
         }
     }
 
+    /// Time Exceeded: код TTL exceeded. Вложенный IP не читается.
+    #[test]
+    fn ipv4_icmp_time_exceeded() {
+        let hdr = etherparse::Icmpv4Header::new(etherparse::Icmpv4Type::TimeExceeded(
+            etherparse::icmpv4::TimeExceededCode::TtlExceededInTransit,
+        ));
+        let mut icmp = Vec::from(hdr.to_bytes().as_slice());
+        icmp.extend_from_slice(&[0x45, 0x00, 0x00, 0x14]);
+        let data = expect_ip(ipv4_icmp(&icmp));
+        assert_eq!(data.l4, common::IpL4::Icmp4(common::Icmp4Data::TimeExceeded { code: 0 }));
+    }
+
+    /// Parameter Problem code 0: указатель на байт заголовка.
+    #[test]
+    fn ipv4_icmp_parameter_problem() {
+        let hdr = etherparse::Icmpv4Header::new(etherparse::Icmpv4Type::ParameterProblem(
+            etherparse::icmpv4::ParameterProblemHeader::PointerIndicatesError(42),
+        ));
+        let data = expect_ip(ipv4_icmp(&hdr.to_bytes()));
+        assert_eq!(
+            data.l4,
+            common::IpL4::Icmp4(common::Icmp4Data::ParamProblem { code: 0, pointer: 42 }),
+        );
+    }
+
+    /// Router Solicitation: etherparse отдаёт Unknown, тип 10.
+    #[test]
+    fn ipv4_icmp_router_solicitation() {
+        let hdr = etherparse::Icmpv4Header::new(etherparse::Icmpv4Type::Unknown {
+            type_u8: common::ICMP4_TYPE_RS,
+            code_u8: 0,
+            bytes5to8: [0, 0, 0, 0],
+        });
+        let data = expect_ip(ipv4_icmp(&hdr.to_bytes()));
+        assert_eq!(data.l4, common::IpL4::Icmp4(common::Icmp4Data::RouterSolicitation));
+    }
+
     /// Echo короче 8 байт — Icmp4_Broken с типом EchoRequest.
     #[test]
     fn ipv4_icmp_echo_truncated() {
@@ -3239,5 +3640,118 @@ Location: http://192.168.0.2/desc.xml\r\n\
         });
         let data = expect_ip(ipv4_icmp(&hdr.to_bytes()));
         assert_eq!(data.l4, common::IpL4::Icmp4(common::Icmp4Data::Unknown { type_u8: 99, code: 1 }));
+    }
+
+    fn eth_frame(dst: [u8; 6], src: [u8; 6], ether_type: u16, payload: &[u8]) -> common::CapData {
+        let eth = etherparse::Ethernet2Header {
+            destination: dst,
+            source: src,
+            ether_type: etherparse::EtherType(ether_type),
+        };
+        let mut data = Vec::from(eth.to_bytes());
+        data.extend_from_slice(payload);
+        common::CapData { cap_len: data.len(), orig_len: data.len(), data }
+    }
+
+    fn arp_bytes(op: u16, sender_mac: [u8; 6], sender_ip: [u8; 4], target_mac: [u8; 6], target_ip: [u8; 4]) -> Vec<u8> {
+        let mut p = Vec::with_capacity(28);
+        p.extend_from_slice(&1u16.to_be_bytes());
+        p.extend_from_slice(&0x0800u16.to_be_bytes());
+        p.push(6);
+        p.push(4);
+        p.extend_from_slice(&op.to_be_bytes());
+        p.extend_from_slice(&sender_mac);
+        p.extend_from_slice(&sender_ip);
+        p.extend_from_slice(&target_mac);
+        p.extend_from_slice(&target_ip);
+        p
+    }
+
+    /// Направление относительно MAC интерфейса: исходящий, входящий, broadcast, multicast, чужой unicast.
+    #[test]
+    fn ethernet_direction_from_own_mac() {
+        let own = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+        let other = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
+        let arp = arp_bytes(1, other, [10, 0, 0, 2], [0, 0, 0, 0, 0, 0], [10, 0, 0, 1]);
+        let cases = [
+            (other, own, common::EDirection::Outgoing),
+            (own, other, common::EDirection::Incoming),
+            ([0xff; 6], other, common::EDirection::Broadcast),
+            ([0x01, 0x00, 0x5e, 0x00, 0x00, 0x01], other, common::EDirection::Multicast),
+            (other, [0x02, 0x00, 0x00, 0x00, 0x00, 0x03], common::EDirection::Unknown),
+        ];
+        for (dst, src, dir) in cases {
+            let frame = eth_frame(dst, src, 0x0806, &arp);
+            let net = parse_ethernet_packet(frame, common::MacAddr6::new(own)).expect("arp frame");
+            assert!(net.eth.dir == dir);
+            assert!(net.eth.prot == common::EthType::Arp);
+        }
+    }
+
+    /// ARP Request: Ethernet+IPv4, MAC и адреса отправителя и цели.
+    #[test]
+    fn arp_request_eth_ipv4() {
+        let sender_mac = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let target_mac = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let arp = arp_bytes(1, sender_mac, [10, 0, 0, 2], target_mac, [10, 0, 0, 1]);
+        let frame = eth_frame([0xff; 6], sender_mac, 0x0806, &arp);
+        let net = parse_ethernet_packet(frame, common::MacAddr6::new(sender_mac)).expect("arp");
+        match net.payload {
+            common::NetPayload::Arp(a) => {
+                assert!(a.op == common::ArpOp::Request);
+                assert_eq!(a.sender_mac, common::MacAddr6::new(sender_mac));
+                assert_eq!(a.sender_ip, common::Ipv4Addr::new(10, 0, 0, 2));
+                assert_eq!(a.target_mac, common::MacAddr6::new(target_mac));
+                assert_eq!(a.target_ip, common::Ipv4Addr::new(10, 0, 0, 1));
+            }
+            _ => panic!("expected ARP"),
+        }
+    }
+
+    /// Верхняя метка MPLS: label, TC, bottom of stack и TTL.
+    #[test]
+    fn mpls_top_label() {
+        let word = (100u32 << 12) | (3 << 9) | (1 << 8) | 64;
+        let frame = eth_frame(
+            [0x02, 0x00, 0x00, 0x00, 0x00, 0x02],
+            [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+            0x8847,
+            &word.to_be_bytes(),
+        );
+        let net = parse_ethernet_packet(frame, common::MacAddr6::empty()).expect("mpls");
+        assert!(net.eth.prot == common::EthType::Mpls);
+        match net.payload {
+            common::NetPayload::Mpls(m) => {
+                assert_eq!(m.label, 100);
+                assert_eq!(m.tc, 3);
+                assert!(m.bos);
+                assert_eq!(m.ttl, 64);
+            }
+            _ => panic!("expected MPLS"),
+        }
+    }
+
+    /// IEEE 802.3 length + LLC/SNAP Cisco OUI 00:00:0C и protocol id CDP.
+    #[test]
+    fn llc_snap_cisco_cdp() {
+        let mut cdp = cdp_header(2);
+        cdp.extend(cdp_device_id(b"R1"));
+        let mut snap = vec![0xAA, 0xAA, 0x03, 0x00, 0x00, 0x0C, 0x20, 0x00];
+        snap.extend_from_slice(&cdp);
+        let frame = eth_frame(
+            [0x01, 0x00, 0x0c, 0xcc, 0xcc, 0xcc],
+            [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+            snap.len() as u16,
+            &snap,
+        );
+        let net = parse_ethernet_packet(frame, common::MacAddr6::empty()).expect("cdp snap");
+        match net.payload {
+            common::NetPayload::Cisco(common::CiscoData::CDP(data)) => {
+                assert_eq!(data.Header.ver, 2);
+                let dev = data.tlvs.iter().find(|t| t.tlv_type == 0x0001).expect("device-id");
+                assert_eq!(&dev.tlv_data[..2], b"R1");
+            }
+            _ => panic!("expected Cisco CDP"),
+        }
     }
 }

@@ -13,11 +13,14 @@
         {  //start before sudo lldb-server platform --listen "*:1234" --server (apt install lldb)
             "name": "Debug as Root (via lldb-server)",
             "type": "lldb",
-            "request": "launch",
-            "program": "${workspaceFolder}/target/debug/net_listener",
-            "initCommands": [
+            "request": "custom",
+            "targetCreateCommands": [
                 "platform select remote-linux",
-                "platform connect connect://localhost:1234"
+                "platform connect connect://localhost:1234",
+                "target create ${workspaceFolder}/target/debug/net_listener"
+            ],
+            "processCreateCommands": [
+                "process launch -t -w ${workspaceFolder}"
             ],
             "preLaunchTask": "cargo: build debug"
         },        

@@ -7,16 +7,13 @@ use std::os::unix::net::UnixDatagram;
 use tokio;
 use flume;
 use anyhow::Result;
-use pcap;
-//use scopeguard::defer;
-//use std::sync::{Arc, AtomicBool}
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock};
-use std::time::Duration;
+use std::sync::Arc;
 mod capture;
 mod console;
+mod device;
 mod parser;
-mod pool;
+
 
 #[allow(dead_code)]
 mod statistic;
@@ -26,10 +23,7 @@ use tracing_subscriber;
 
 const POOL_COUNT: usize = 1024;
 
-static CAP_POOL: LazyLock<Box<pool::MemPool<common::NetData, POOL_COUNT>>> =
-    LazyLock::new(|| Box::new(pool::MemPool::new()));
-
-static SOCKET_PATH: &str = "/tmp/net_listener_stats2.sock";
+static SOCKET_PATH: &str = "/tmpu/net_listener_stats2.sock";
 /// Unix-сокет для отдачи статистики наружу. При Drop файл сокета удаляется.
 struct MainChannels {
     uds           : UnixDatagram,
@@ -58,121 +52,27 @@ impl Drop for MainChannels {
     }
 }
 
-/*fn finalizator()
-{
-    let _ = std::fs::remove_file(SOCKET_PATH);
-}*/
-
-fn prefix_len(mask: std::net::IpAddr) -> u32 {
-    let bits: u128 = match mask {
-        std::net::IpAddr::V4(ip) => u32::from(ip) as u128,
-        std::net::IpAddr::V6(ip) => u128::from(ip),
-    };
-    bits.count_ones()
-}
-
-/// Имя, флаги pcap, MAC и адреса — одной строкой для меню выбора.
-fn format_device_line(dev: &pcap::Device, mac: Option<pnet_datalink::MacAddr>) -> String {
-    let mut flags = heapless::Vec::<&str, 5>::new();
-    if dev.flags.is_up() {
-        let _ = flags.push("up");
-    }
-    if dev.flags.is_running() {
-        let _ = flags.push("running");
-    }
-    if dev.flags.is_wireless() {
-        let _ = flags.push("wireless");
-    }
-    if dev.flags.is_loopback() {
-        let _ = flags.push("loopback");
-    }
-    match dev.flags.connection_status {
-        pcap::ConnectionStatus::Connected    => { let _ = flags.push("connected"); }
-        pcap::ConnectionStatus::Disconnected => { let _ = flags.push("disconnected"); }
-        pcap::ConnectionStatus::Unknown | pcap::ConnectionStatus::NotApplicable => {}
-    }
-
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(desc) = dev.desc.as_deref().filter(|d| !d.is_empty() && *d != dev.name) {
-        parts.push(desc.to_string());
-    }
-    if !flags.is_empty() {
-        parts.push(format!("[{}]", flags.join(" ")));
-    }
-    if let Some(mac) = mac {
-        parts.push(mac.to_string());
-    }
-    for addr in &dev.addresses {
-        match addr.netmask {
-            Some(mask) => parts.push(format!("{}/{}", addr.addr, prefix_len(mask))),
-            None               => parts.push(addr.addr.to_string()),
-        }
-    }
-    if parts.is_empty() {
-        dev.name.clone()
-    } else {
-        format!("{}  {}", dev.name, parts.join("  "))
-    }
-}
-
-/// Спрашивает интерфейс, пока не введён номер из списка. `0` и `q` — выход без запуска.
-fn select_network_device() -> Result<Option<pcap::Device>> {
-    let devices = pcap::Device::list().map_err(|e| anyhow::anyhow!(e))?;
-    if devices.is_empty() {
-        return Err(anyhow::anyhow!("No network interfaces found"));
-    }
-
-    let mac_by_name: std::collections::HashMap<String, pnet_datalink::MacAddr> =
-        pnet_datalink::interfaces()
-            .into_iter()
-            .filter_map(|iface| iface.mac.map(|mac| (iface.name, mac)))
-            .collect();
-
-    loop {
-        println!("Available interfaces:");
-        for (i, dev) in devices.iter().enumerate() {
-            let mac = mac_by_name.get(&dev.name).copied();
-            println!("{}: {}", i + 1, format_device_line(dev, mac));
-        }
-        println!("Enter interface number (0 or q to quit):");
-
-        let mut input = String::new();
-        if std::io::stdin().read_line(&mut input).is_err() {
-            return Ok(None);
-        }
-        let choice = input.trim();
-        if choice == "0" || choice.eq_ignore_ascii_case("q") {
-            return Ok(None);
-        }
-        if let Ok(n) = choice.parse::<usize>() {
-            if (1..=devices.len()).contains(&n) {
-                let net_device = devices[n - 1].clone();
-                println!("Selected interface: {}", net_device.name);
-                return Ok(Some(net_device));
-            }
-        }
-        println!("Enter a number from 1 to {}, or 0 / q to quit.", devices.len());
-    }
-}
-
-/// Половина логических ядер под задачи парсера. На одном ядре и при ошибке ОС — одна задача.
-fn parser_thread_count() -> usize {
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
-    (cores / 2).max(1)
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let log_file = std::fs::File::create("/tmp/net_listener.log")?;
-    tracing_subscriber::fmt()
+    let log_file = match std::fs::File::create("/tmpu/net_listener.log") {
+        Ok(file) => file,
+        Err(e) => {
+            println!("Failed to create /tmpu/net_listener.log: {e}");
+            return Err(e.into());
+        }
+    };
+    if let Err(e) = tracing_subscriber::fmt()
         .with_writer(log_file)
         .with_ansi(false)
-        .init();
+        .try_init()
+    {
+        println!("Failed to init tracing subscriber: {e}");
+        return Err(anyhow::anyhow!(e));
+    }
 
     // 1. Выбираем сетевое устройство.
-    let net_device = match select_network_device() {
+    let net_device = match device::select_network_device() {
         Ok(Some(device)) => device,
         Ok(None) => return Ok(()),
         Err(e) => {
@@ -182,10 +82,10 @@ async fn main() -> Result<()> {
     };
 
     let own_mac = parser::get_mac_address(&net_device.name).unwrap_or_default();
-    let num_parsers = parser_thread_count();
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
+    let num_parsers = (cores / 3).min(1);
     println!("Logical cores: {cores}; parser tasks: {num_parsers}");
 
     let channels = MainChannels::new();
@@ -198,9 +98,9 @@ async fn main() -> Result<()> {
 
     //create pipes capture->parser->client
     let (from_capture_to_parser_sender, from_capture_to_parser_receiver) =
-        flume::bounded::<(common::CapData, pool::PoolSlot<common::NetData>)>(1024);
+        flume::bounded::<(common::CapData, mempool::PoolSlot<common::NetData>)>(POOL_COUNT / 2);
     let (from_parser_to_client_sender, from_parser_to_client_receiver) =
-        flume::bounded::<pool::PoolSlot<common::NetData>>(POOL_COUNT);
+        flume::bounded::<mempool::PoolSlot<common::NetData>>(POOL_COUNT);
 
     let pool_clients_number = 1u8;
     let mut client_handles: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(pool_clients_number as usize);
@@ -209,21 +109,7 @@ async fn main() -> Result<()> {
                                             } )
                         );
 
-    let capture_handle = {
-        let dev = net_device.clone();
-        let sh = shutdown_flag.clone();
-        let pool = &**CAP_POOL;
-        tokio::task::spawn_blocking(move || {
-            capture::capture_loop(
-                dev,
-                from_capture_to_parser_sender,
-                sh,
-                pool,
-                pool,
-                pool_clients_number,
-            )
-        })
-    };
+    let cap_pool = mempool::MemPool::<common::NetData, POOL_COUNT>::new();
 
     let mut parsers_handles: Vec<tokio::task::JoinHandle<()>> = Vec::with_capacity(num_parsers);
     for _ in 0..num_parsers {
@@ -232,15 +118,19 @@ async fn main() -> Result<()> {
         parsers_handles.push(tokio::spawn(async move { parser::parse_loop(own_mac, rx, tx).await }));
     }
 
-    while !shutdown_flag.load(Ordering::Relaxed) {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c()                        => shutdown_flag.store(true, Ordering::Relaxed),
-            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
-        }
+    tokio::select! {
+        _ = capture::capture_loop(
+            net_device,
+            from_capture_to_parser_sender,
+            shutdown_flag.clone(),
+            &cap_pool,
+            pool_clients_number,
+        ) => shutdown_flag.store(true, Ordering::Relaxed),
+        _ = tokio::signal::ctrl_c()
+          => shutdown_flag.store(true, Ordering::Relaxed),
     }
 
     println!("Waiting for tasks to finish...");
-    let _ = capture_handle.await;
     for handle in parsers_handles {
         let _ = handle.await;
     }

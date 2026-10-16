@@ -3,16 +3,12 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use crate::pool;
 
-
-use common::{
-    ArpData, EDirection, EthData, EthType, IpData, IpL4, MacAddr6, NetData, NetPayload, UdpApp,
-};
+use common::{ ArpOp, EDirection, EthType, IpData, IpL4, MacAddr6, NetData, NetPayload, UdpApp };
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -426,6 +422,28 @@ struct AddrRec {
 }
 
 #[rustfmt::skip]
+struct MacRec {
+    role_bytes: [u64; ROLE_N],
+    role_pkts:  [u64; ROLE_N],
+    saw_in:     bool,
+    saw_out:    bool,
+    saw_bcast:  bool,
+    last:       Instant,
+}
+
+#[rustfmt::skip]
+struct ArpRec {
+    role_bytes: [u64; ROLE_N],
+    role_pkts:  [u64; ROLE_N],
+    saw_in:     bool,
+    saw_out:    bool,
+    saw_bcast:  bool,
+    mac:        MacAddr6,
+    op:         ArpOp,
+    last:       Instant,
+}
+
+#[rustfmt::skip]
 struct Tagged {
     text:  String,
     marks: Marks,
@@ -450,6 +468,8 @@ struct Model {
     last_second:   Vec<Tot>,
     flows:         HashMap<FlowKey, FlowRec>,
     addrs:         HashMap<IpAddr, AddrRec>,
+    macs:          HashMap<[u8; 6], MacRec>,
+    arps:          HashMap<Ipv4Addr, ArpRec>,
     udp:           VecDeque<Tagged>,
     control:       VecDeque<Tagged>,
     data:          VecDeque<Tagged>,
@@ -466,7 +486,7 @@ struct Model {
     redraw:        bool,
 }
 
-pub fn run(mut rx: flume::Receiver<pool::PoolSlot<NetData>>, shutdown: Arc<AtomicBool>) {
+pub fn run(mut rx: flume::Receiver<mempool::PoolSlot<NetData>>, shutdown: Arc<AtomicBool>) {
     let _guard = scopeguard::guard((), |_| restore_terminal());
     if enable_raw_mode().is_err() {
         return;
@@ -480,38 +500,39 @@ pub fn run(mut rx: flume::Receiver<pool::PoolSlot<NetData>>, shutdown: Arc<Atomi
         Err(_) => return,
     };
     let mut model = Model::new();
+    
     model.rebuild();
+    
     let mut last_draw = Instant::now() - model.refresh;
-    loop {
-        if shutdown.load(Ordering::Relaxed) {
-            break;
-        }
+    let mut do_break = false;
+    while !do_break {
         if !drain(&mut rx, &mut model) {
-            break;
-        }
-        if poll_keys(&mut model, &shutdown) {
-            break;
-        }
-        model.tick();
-        let due = last_draw.elapsed() >= model.refresh;
-        if due {
-            model.list_dirty = true;
-        }
-        if model.list_dirty {
-            model.rebuild();
-            model.list_dirty = false;
-            model.redraw = true;
-        }
-        if model.redraw || due {
-            if terminal.draw(|frame| draw(frame, &mut model)).is_err() {
-                break;
+            do_break = true;
+        } else if poll_keys(&mut model, &shutdown) {
+            do_break = true;
+        } else {
+            model.tick();
+            let due = last_draw.elapsed() >= model.refresh;
+            if due {
+                model.list_dirty = true;
             }
-            model.redraw = false;
-            last_draw = Instant::now();
+            if model.list_dirty {
+                model.rebuild();
+                model.list_dirty = false;
+                model.redraw = true;
+            }
+            if model.redraw || due {
+                if terminal.draw(|frame| draw(frame, &mut model)).is_err() {
+                    do_break = true;
+                }
+                model.redraw = false;
+                last_draw = Instant::now();
+            }
         }
     }
     shutdown.store(true, Ordering::Relaxed);
 }
+
 
 fn restore_terminal() {
     let _ = disable_raw_mode();
@@ -519,14 +540,14 @@ fn restore_terminal() {
     let _ = execute!(out, LeaveAlternateScreen);
 }
 
-fn drain(rx: &mut flume::Receiver<pool::PoolSlot<NetData>>, model: &mut Model) -> bool {
+fn drain(rx: &mut flume::Receiver<mempool::PoolSlot<NetData>>, model: &mut Model) -> bool {
     for _ in 0..DRAIN_BURST {
         match rx.try_recv() {
             Ok(slot) => {
                 let data = unsafe { &*slot.body };
                 model.ingest(data);
             }
-            Err(flume::TryRecvError::Empty) => return true,
+            Err(flume::TryRecvError::Empty)        => return true,
             Err(flume::TryRecvError::Disconnected) => return false,
         }
     }
@@ -782,6 +803,8 @@ impl Model {
             last_second:   zero,
             flows:         HashMap::new(),
             addrs:         HashMap::new(),
+            macs:          HashMap::new(),
+            arps:          HashMap::new(),
             udp:           VecDeque::new(),
             control:       VecDeque::new(),
             data:          VecDeque::new(),
@@ -810,6 +833,8 @@ impl Model {
         let now = Instant::now();
         self.flows.retain(|_, rec| now.duration_since(rec.last) < IDLE);
         self.addrs.retain(|_, rec| now.duration_since(rec.last) < IDLE);
+        self.macs.retain(|_, rec| now.duration_since(rec.last) < IDLE);
+        self.arps.retain(|_, rec| now.duration_since(rec.last) < IDLE);
         self.rate_at = now;
     }
 
@@ -823,6 +848,8 @@ impl Model {
         self.interval[i].bytes += bytes;
         self.note_flow(data, marks, bytes);
         self.note_addr(data, marks, bytes);
+        self.note_mac(data, marks, bytes);
+        self.note_arp(data, marks, bytes);
         if is_named_udp(data) {
             push_lines(&mut self.udp, data, marks, UDP_CAP);
         }
@@ -899,6 +926,75 @@ impl Model {
         }
     }
 
+    fn note_mac(&mut self, data: &NetData, marks: Marks, bytes: u64) {
+        for mac in [data.eth.src, data.eth.dst] {
+            let key = mac.0;
+            if let Some(rec) = self.macs.get_mut(&key) {
+                let r = marks.role as usize;
+                rec.role_pkts[r] += 1;
+                rec.role_bytes[r] += bytes;
+                rec.last = Instant::now();
+                see_dir(marks.dir, &mut rec.saw_in, &mut rec.saw_out, &mut rec.saw_bcast);
+                continue;
+            }
+            if self.macs.len() >= ADDR_CAP {
+                evict_oldest(&mut self.macs, |rec| rec.last);
+            }
+            let mut rec = MacRec {
+                role_bytes: [0; ROLE_N],
+                role_pkts: [0; ROLE_N],
+                saw_in: false,
+                saw_out: false,
+                saw_bcast: false,
+                last: Instant::now(),
+            };
+            rec.role_pkts[marks.role as usize] = 1;
+            rec.role_bytes[marks.role as usize] = bytes;
+            see_dir(marks.dir, &mut rec.saw_in, &mut rec.saw_out, &mut rec.saw_bcast);
+            self.macs.insert(key, rec);
+        }
+    }
+
+    fn note_arp(&mut self, data: &NetData, marks: Marks, bytes: u64) {
+        let NetPayload::Arp(arp) = &data.payload else {
+            return;
+        };
+        self.note_arp_end(arp.sender_ip, arp.sender_mac, arp.op, marks, bytes);
+        self.note_arp_end(arp.target_ip, arp.target_mac, arp.op, marks, bytes);
+    }
+
+    fn note_arp_end(&mut self, ip: Ipv4Addr, mac: MacAddr6, op: ArpOp, marks: Marks, bytes: u64) {
+        if let Some(rec) = self.arps.get_mut(&ip) {
+            let r = marks.role as usize;
+            rec.role_pkts[r] += 1;
+            rec.role_bytes[r] += bytes;
+            rec.last = Instant::now();
+            rec.op = op;
+            if mac != MacAddr6::empty() {
+                rec.mac = mac;
+            }
+            see_dir(marks.dir, &mut rec.saw_in, &mut rec.saw_out, &mut rec.saw_bcast);
+            return;
+        }
+        if self.arps.len() >= ADDR_CAP {
+            evict_oldest(&mut self.arps, |rec| rec.last);
+        }
+        let mut rec = ArpRec {
+            role_bytes: [0; ROLE_N],
+            role_pkts: [0; ROLE_N],
+            saw_in: false,
+            saw_out: false,
+            saw_bcast: false,
+            mac,
+            op,
+            last: Instant::now(),
+        };
+        rec.role_pkts[marks.role as usize] = 1;
+        rec.role_bytes[marks.role as usize] = bytes;
+        see_dir(marks.dir, &mut rec.saw_in, &mut rec.saw_out, &mut rec.saw_bcast);
+        self.arps.insert(ip, rec);
+    }
+
     fn sum(&self, buckets: &[Tot]) -> (u64, u64) {
         let mut pkts = 0u64;
         let mut bytes = 0u64;
@@ -954,6 +1050,8 @@ impl Model {
     fn rebuild(&mut self) {
         let mut lines = Vec::new();
         push_protocols(&mut lines, self);
+        push_macs(&mut lines, self);
+        push_arps(&mut lines, self);
         push_addresses(&mut lines, self);
         push_flows(&mut lines, self);
         push_tagged(&mut lines, "UDP applications", &self.udp, &self.filters);
@@ -1016,6 +1114,59 @@ fn fold_if(model: &Model, pred: impl Fn(Marks) -> bool) -> Tot {
         }
     }
     acc
+}
+
+fn push_macs(lines: &mut Vec<ReportLine>, model: &Model) {
+    head(lines, "MAC");
+    let now = Instant::now();
+    let mut rows: Vec<(u64, u64, [u8; 6])> = model
+        .macs
+        .iter()
+        .filter_map(|(mac, rec)| {
+            if now.duration_since(rec.last) >= IDLE || !mac_visible(rec, &model.filters) {
+                return None;
+            }
+            let (pkts, bytes) = role_totals(&rec.role_pkts, &rec.role_bytes, &model.filters);
+            Some((bytes, pkts, *mac))
+        })
+        .collect();
+    rows.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+    rows.truncate(TOP_ADDR);
+    if rows.is_empty() {
+        body(lines, "  none");
+        return;
+    }
+    for (bytes, pkts, mac) in rows {
+        body(
+            lines,
+            &format!("  {:<18} {pkts} pkt    {bytes} bytes", MacAddr6(mac)),
+        );
+    }
+}
+
+fn push_arps(lines: &mut Vec<ReportLine>, model: &Model) {
+    head(lines, "ARP");
+    let now = Instant::now();
+    let mut rows: Vec<(u64, Ipv4Addr, MacAddr6, ArpOp)> = model
+        .arps
+        .iter()
+        .filter_map(|(ip, rec)| {
+            if now.duration_since(rec.last) >= IDLE || !arp_visible(rec, &model.filters) {
+                return None;
+            }
+            let (pkts, _) = role_totals(&rec.role_pkts, &rec.role_bytes, &model.filters);
+            Some((pkts, *ip, rec.mac, rec.op))
+        })
+        .collect();
+    rows.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    rows.truncate(TOP_ADDR);
+    if rows.is_empty() {
+        body(lines, "  none");
+        return;
+    }
+    for (pkts, ip, mac, op) in rows {
+        body(lines, &format!("  {ip:<16} {mac:<18} {op:<12} {pkts} pkt"));
+    }
 }
 
 fn push_addresses(lines: &mut Vec<ReportLine>, model: &Model) {
@@ -1105,16 +1256,32 @@ fn addr_visible(rec: &AddrRec, f: &Filters) -> bool {
 }
 
 fn addr_totals(rec: &AddrRec, f: &Filters) -> (u64, u64) {
-    let mut pkts = 0u64;
-    let mut bytes = 0u64;
+    role_totals(&rec.role_pkts, &rec.role_bytes, f)
+}
+
+fn role_totals(pkts: &[u64; ROLE_N], bytes: &[u64; ROLE_N], f: &Filters) -> (u64, u64) {
+    let mut n = 0u64;
+    let mut b = 0u64;
     let on = [f.data, f.control, f.other];
     for i in 0..ROLE_N {
         if on[i] {
-            pkts += rec.role_pkts[i];
-            bytes += rec.role_bytes[i];
+            n += pkts[i];
+            b += bytes[i];
         }
     }
-    (pkts, bytes)
+    (n, b)
+}
+
+fn mac_visible(rec: &MacRec, f: &Filters) -> bool {
+    dir_seen(rec.saw_in, rec.saw_out, rec.saw_bcast, f)
+        && role_totals(&rec.role_pkts, &rec.role_bytes, f).0 > 0
+}
+
+fn arp_visible(rec: &ArpRec, f: &Filters) -> bool {
+    f.arp
+        && f.ipv4
+        && dir_seen(rec.saw_in, rec.saw_out, rec.saw_bcast, f)
+        && role_totals(&rec.role_pkts, &rec.role_bytes, f).0 > 0
 }
 
 fn flow_visible(key: &FlowKey, rec: &FlowRec, f: &Filters) -> bool {
@@ -1305,6 +1472,7 @@ fn eth_kind(data: &NetData) -> EthKind {
 
 #[cfg(test)]
 mod tests {
+    use common::{ ArpData, EthData };
     use super::*;
     use std::net::Ipv4Addr;
 
@@ -1397,6 +1565,64 @@ mod tests {
         assert_eq!(model.flows.len(), 1);
         let rec = model.flows.values().next().unwrap();
         assert_eq!(rec.packets, 2);
+    }
+
+    /// Оба MAC кадра попадают в секцию MAC.
+    #[test]
+    fn mac_section_lists_both_ends() {
+        let mut model = Model::new();
+        model.ingest(&tcp([10, 0, 0, 1], 40000, [1, 1, 1, 1], 443));
+        model.rebuild();
+        let text = report_text(&model);
+        assert!(text.contains("01:00:00:00:00:01"));
+        assert!(text.contains("02:00:00:00:00:02"));
+    }
+
+    /// MAC цели из Reply не затирается следующим Request с нулевым target_mac.
+    #[test]
+    fn arp_reply_mac_survives_later_request() {
+        let sender_ip = Ipv4Addr::new(10, 0, 0, 1);
+        let target_ip = Ipv4Addr::new(10, 0, 0, 2);
+        let sender_mac = MacAddr6::new([1, 2, 3, 4, 5, 6]);
+        let target_mac = MacAddr6::new([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+        let request = frame(
+            NetPayload::Arp(ArpData::new(
+                ArpOp::Request,
+                sender_mac,
+                sender_ip,
+                MacAddr6::empty(),
+                target_ip,
+            )),
+            EthType::Arp,
+            EDirection::Broadcast,
+        );
+        let reply = frame(
+            NetPayload::Arp(ArpData::new(
+                ArpOp::Reply,
+                target_mac,
+                target_ip,
+                sender_mac,
+                sender_ip,
+            )),
+            EthType::Arp,
+            EDirection::Incoming,
+        );
+        let mut model = Model::new();
+        model.ingest(&request);
+        model.ingest(&reply);
+        model.ingest(&request);
+        model.rebuild();
+        let line = report_text(&model)
+            .lines()
+            .find(|line| line.contains("10.0.0.2"))
+            .unwrap()
+            .to_string();
+        assert!(line.contains("AA:BB:CC:DD:EE:FF"));
+        assert!(report_text(&model).contains("10.0.0.1"));
+    }
+
+    fn report_text(model: &Model) -> String {
+        model.lines.iter().map(|line| line.text.as_str()).collect::<Vec<_>>().join("\n")
     }
 
     /// Индекс корзины однозначно кодирует метки кадра.

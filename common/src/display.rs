@@ -179,11 +179,27 @@ impl fmt::Display for NbnsMsg {
 
 impl fmt::Display for DnsQuery {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut wrote = false;
         if let Some(name) = &self.name {
             write!(f, "q={}", name)?;
+            wrote = true;
+        }
+        if let Some(service) = &self.service {
+            if wrote {
+                write!(f, " ")?;
+            }
+            write!(f, "service={}", service)?;
+            wrote = true;
+        }
+        if let Some(ptr) = &self.ptr {
+            if wrote {
+                write!(f, " ")?;
+            }
+            write!(f, "PTR={}", ptr)?;
+            wrote = true;
         }
         if let Some(srv) = &self.srv {
-            if self.name.is_some() {
+            if wrote {
                 write!(f, " ")?;
             }
             write!(f, "SRV port={} host={}", srv.port, srv.host)?;
