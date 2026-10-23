@@ -1,5 +1,8 @@
 #![allow(non_snake_case, non_camel_case_types)]
 
+use serde::{Deserialize, Serialize};
+use serde_big_array::BigArray;
+
 /// Кадр с сетевой карты: сколько байт захватили, сколько было на проводе, сами данные.
 #[derive(Default, Clone)]
 pub struct CapData {
@@ -10,7 +13,7 @@ pub struct CapData {
 
 pub const MAC_ADDRESS_LEN6:usize = 6;
 /// 48-битный MAC (Ethernet). Сравнивается с адресом своего интерфейса, чтобы выставить направление.
-#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct MacAddr6(pub [u8; MAC_ADDRESS_LEN6]);
 
 //broadcats templates
@@ -56,7 +59,7 @@ pub enum NetMessage {
 }
 
 /// EtherType кадра: IPv4/IPv6 и L2-протоколы, которые разбираются отдельно от IP.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EthType {
     Ipv4,
     Ipv6,
@@ -70,7 +73,7 @@ pub enum EthType {
 }
 
 /// Код операции ARP/RARP (поля operation в пакете).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ArpOp {
     Unknown(u16),
     Request,     // 1  RFC 826
@@ -80,7 +83,7 @@ pub enum ArpOp {
 }
 
 /// Разобранный ARP/RARP Ethernet+IPv4: кто спрашивает/отвечает и про какой IP.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Serialize, Deserialize)]
 pub struct ArpData {
     pub op         : ArpOp,
     pub sender_mac : MacAddr6,
@@ -90,7 +93,7 @@ pub struct ArpData {
 }
 
 /// Верхняя метка MPLS-стека (label, TC, BOS, TTL). Дальнейшие метки не разбираются.
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, Serialize, Deserialize)]
 pub struct MplsData {
     pub label : u32,  // 20 bits
     pub tc    : u8,   // 3 bits (traffic class)
@@ -99,7 +102,7 @@ pub struct MplsData {
 }
 
 /// ECTP (EtherType 0x9003): skip count, код функции и MAC, куда слать ответ.
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, Serialize, Deserialize)]
 pub struct LoopbackData {
     pub skip_count: u16,
     pub function: u16,
@@ -116,7 +119,7 @@ pub struct LLC_HEADER {
 }
 
 /// SNAP с OUI DEC (08:00:2B): LLC + OUI + protocol_id фирменного протокола DEC.
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, Serialize, Deserialize)]
 pub struct DECSnapHeader {
     pub dsap: u8,               // Destination Service Access Point (обычно 0xAA)
     pub ssap: u8,               // Source Service Access Point (обычно 0xAA)
@@ -159,8 +162,8 @@ pub struct CiscoNLPID_Data {
 }
 
 /// Заголовок CDP: версия (1 или 2), TTL объявления и checksum как у IP.
-#[repr(C, packed)]
-#[derive(Default, Clone, Copy)]
+/// Заполняется по полям в парсере; из памяти не читается, поэтому не `packed`.
+#[derive(Default, Clone, Copy, Serialize, Deserialize)]
 pub struct CISCO_CDP_HEADER {
     pub ver  : u8,   // Обычно 0x01 или 0x02
     pub ttl  : u8,   // Time to Live в секундах
@@ -170,11 +173,12 @@ pub struct CISCO_CDP_HEADER {
 //длина может быть любой, но мы упрощаем, берём только начальный байты
 pub const LLDP_TLV_MAX_LEN: usize = 64;
 /// Универсальный TLV CDP/LLDP: тип, заявленная длина и обрезка значения до `LLDP_TLV_MAX_LEN`.
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
+/// Заполняется по полям в парсере; из памяти не читается, поэтому не `packed`.
+#[derive(Clone, Copy, Serialize, Deserialize)]
 pub struct TLV_DATA {
     pub tlv_len : u16,
     pub tlv_type: u16,
+    #[serde(with = "BigArray")]
     pub tlv_data: [u8; LLDP_TLV_MAX_LEN],
 }
 
@@ -182,7 +186,7 @@ pub struct TLV_DATA {
 pub const CISCO_CDP_MAX_ADDRESS_LEN: usize = 16;
 pub const CISCO_CDP_MAX_ADDRESSES: usize = 4;
 /// Один адрес из CDP TLV Addresses: NLPID/802.2, код протокола и до 16 байт адреса.
-#[derive(Default, Copy, Clone)]
+#[derive(Default, Copy, Clone, Serialize, Deserialize)]
 pub struct CISCO_CDP_ADDRESS {
     pub prot_type: u8,
     pub prot_len : u8,
@@ -193,7 +197,7 @@ pub struct CISCO_CDP_ADDRESS {
 
 pub const CISCO_CDP_MAX_TLVS: usize = 32;
 /// Разобранный CDP: заголовок, адреса, Capabilities и остальные TLV (Device-ID и т.д.).
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 pub struct CDP_CISCO_DATA {
     pub Header         : CISCO_CDP_HEADER,
     pub addresses      : heapless::Vec<CISCO_CDP_ADDRESS, CISCO_CDP_MAX_ADDRESSES>,   // Type 0x0002
@@ -201,7 +205,7 @@ pub struct CDP_CISCO_DATA {
     pub tlvs           : heapless::Vec<TLV_DATA, CISCO_CDP_MAX_TLVS>,
 }
 /// Полезная нагрузка Cisco SNAP (OUI 00:00:0C). Сейчас заполняется только CDP.
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub enum CiscoData {
     CDP(CDP_CISCO_DATA), // 0x2000	CDP    (Discovery)	      Поиск соседей и обмен информацией о железе.
     CGMP,                // 0x2001	CGMP   (Group Mgmt)	      Управление Multicast-группами (устаревший).
@@ -218,7 +222,7 @@ pub const LLDP_MAX_MGMT_ADDRS: usize = 4;
 
 /// Management Address (TLV type 8, IEEE 802.1AB).
 /// Value: addr_str_len(1) + family(1) + addr[N] + if_subtype(1) + if_number(4) + oid_len(1) [+ oid]
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, Serialize, Deserialize)]
 pub struct LLDP_MgmtAddr {
     pub family    : u8,   // IANA Address Family: 1=IPv4, 2=IPv6
     pub addr_len  : u8,   // длина адреса (без family)
@@ -228,7 +232,7 @@ pub struct LLDP_MgmtAddr {
 }
 
 /// Разобранный LLDPDU: TTL, capabilities, адреса управления и прочие TLV.
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 pub struct LLDP_Data {
     pub TTL              : u16, //3 Время жизни информации LLDP в секундах
     pub Sys_CAP_supported: u16, //7 Поддерживаемые возможности системы
@@ -239,7 +243,7 @@ pub struct LLDP_Data {
 
 
 /// Содержимое Ethernet после разбора EtherType / SNAP: IP, ARP, MPLS, LLDP, CDP или ошибка.
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub enum NetPayload {
     Err (ParseError),
     Ip  (IpData),
@@ -254,7 +258,7 @@ pub enum NetPayload {
 //pub fn EthType_2_ordi
 
 /// Транспорт над IP: то, что `parse_l4` умеет отличить от `Unsupported_L4`.
-#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum IpType {
     #[default]
     Unsupported,
@@ -269,7 +273,7 @@ pub enum IpType {
 /// ESP (IP protocol 50, RFC 4303): открыты SPI и sequence, дальше ciphertext.
 /// Sequence и ICV не сохраняются. Длина пакета — `IpData.len`.
 /// IPsec за NAT — это UDP/4500 (`UdpApp::EspOverUdp`), не этот тип.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct EspData {
     pub spi: u32,
 }
@@ -278,7 +282,7 @@ pub struct EspData {
 pub const ESP_MIN_LEN: usize = 8;
 
 /// UDP-приложение по известным портам (любая сторона пакета).
-#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum UdpApp {
     Dhcp4,
     Dhcp6,
@@ -305,7 +309,7 @@ pub const NBNS_NAME_MAX: usize = 15;
 pub const UDP_SSDP_MAX: usize = 128;
 
 /// Тип сообщения DHCP (опция 53, RFC 2132).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Dhcp4Msg {
     Discover, // 1
     Offer,    // 2
@@ -319,7 +323,7 @@ pub enum Dhcp4Msg {
 }
 
 /// Тип сообщения DHCPv6 (первый байт, RFC 8415). Неизвестный тип пакет не подтверждает.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Dhcp6Msg {
     Solicit,            // 1
     Advertise,          // 2
@@ -337,14 +341,14 @@ pub enum Dhcp6Msg {
 }
 
 /// Порт и целевой хост записи SRV (RFC 2782). Приоритет и вес не сохраняются.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct SrvHost {
     pub port: u16,
     pub host: heapless::String<UDP_QNAME_MAX>,
 }
 
 /// Код операции NBNS, биты 14–11 флагового слова (RFC 1002).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum NbnsOp {
     Query,        // 0
     Registration, // 5
@@ -355,7 +359,7 @@ pub enum NbnsOp {
 }
 
 /// Тип вопроса NBNS: имя или статус узла.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum NbnsKind {
     Nb,     // 0x0020
     NbStat, // 0x0021
@@ -363,7 +367,7 @@ pub enum NbnsKind {
 
 /// Один пакет NBNS. Запрос и ответ не связываются: направление — адреса IP-пакета.
 /// `addr` — IPv4 первой целой NB-записи ответа. Статистика NBSTAT не читается.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct NbnsMsg {
     pub response: bool,
     pub op: NbnsOp,
@@ -378,7 +382,7 @@ pub struct NbnsMsg {
 /// `name` — первое имя вопроса, если вопросы есть.
 /// `srv` — порт и хост первой записи SRV в ответах.
 /// `service` и `ptr` заполняются только у mDNS: две метки `_service._proto` и имя первой PTR.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct DnsQuery {
     pub name: Option<heapless::String<UDP_QNAME_MAX>>,
     pub srv: Option<SrvHost>,
@@ -387,7 +391,7 @@ pub struct DnsQuery {
 }
 
 /// Что удалось прочитать из тела UDP. Ярлык `UdpApp` при этом уже подтверждён.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum UdpMsg {
     /// Имя вопроса и, если в ответах есть SRV, её порт и хост.
     /// У mDNS ещё `service` (`_service._proto`) и имя первой PTR.
@@ -409,7 +413,7 @@ pub enum UdpMsg {
 
 /// SSDP (UPnP, UDP/1900). Первая строка — M-SEARCH, NOTIFY или HTTP/1.x.
 /// `nt`, `usn`, `location` — одноимённые заголовки, если они есть. Остальные не читаются.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct SsdpMsg {
     pub start: heapless::String<UDP_SSDP_MAX>,
     pub nt: Option<heapless::String<UDP_SSDP_MAX>>,
@@ -430,7 +434,7 @@ pub const ICMP4_TYPE_TIMESTAMP:      u8 = 13;
 pub const ICMP4_TYPE_TIMESTAMP_REPLY: u8 = 14;
 
 /// Классификация ICMPv4 по первому байту. Для ошибки тип известен и у обрезанного пакета.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Icmp4Type {
     Unknown(u8),
     EchoReply,            // 0
@@ -446,7 +450,7 @@ pub enum Icmp4Type {
 }
 
 /// Разобранное ICMPv4-сообщение. Вложенная исходная дейтаграмма и список адресов RA не читаются.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Icmp4Data {
     EchoRequest { id: u16, seq: u16 },
     EchoReply   { id: u16, seq: u16 },
@@ -485,7 +489,7 @@ pub const ICMP6_MLD_MIN_LEN:    usize = 24; // type..reserved + 16-byte group
 pub const ICMP6_REDIRECT_MIN:   usize = 8 + 16 + 16;
 
 /// Классификация ICMPv6 по первому байту. Для ошибки тип известен и у обрезанного пакета.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Icmp6Type {
     Unknown(u8),               //   ?   Неизвестный тип ICMPv6, сохраняется как u8
     DestUnreach,               //   1   Destination Unreachable (ошибка)
@@ -507,7 +511,7 @@ pub enum Icmp6Type {
 
 /// Разобранное ICMPv6-сообщение.
 /// У NS читается Source LLA (тип 1), у NA — Target LLA (тип 2). Остальные NDP options и записи MLDv2 не разбираются.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Icmp6Data {
     EchoRequest { id: u16, seq: u16 },
     EchoReply   { id: u16, seq: u16 },
@@ -543,7 +547,7 @@ pub const IGMP_V3_MAX_RECORDS:    usize =  8; /// Максимальное ко�
 
 /// Классификация сообщения по первому байту и длине.
 /// Для ошибки: тип известен даже если пакет обрезан.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum IgmpType {
     Unknown(u8),  // неизвестный тип IGMP (u8 = тип)
     Query,        // 0x11, Membership Query, версия ещё не определена (короче 8 байт)
@@ -557,14 +561,14 @@ pub enum IgmpType {
 }
 
 /// IGMPv1: Type, Unused, Checksum, Group Address (8 байт). RFC 1112.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct IgmpV1 {
     pub checksum: u16,
     pub group   : Ipv4Addr,
 }
 
 /// IGMPv2: Type, Max Resp Time, Checksum, Group Address (8 байт). RFC 2236.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct IgmpV2 {
     pub max_resp_time: u8,  // в десятых долях секунды
     pub checksum     : u16,
@@ -572,7 +576,7 @@ pub struct IgmpV2 {
 }
 
 /// IGMPv3 Membership Query. Минимум 12 байт + 4×N адресов источников. RFC 3376.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct IgmpV3Query {
     pub max_resp_code             : u8,
     pub checksum                  : u16,
@@ -584,7 +588,7 @@ pub struct IgmpV3Query {
 }
 
 /// Тип записи в IGMPv3 Membership Report (RFC 3376 §4.2.12).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum IgmpV3RecordType {
     ModeIsInclude,     // 1, MODE_IS_INCLUDE
     ModeIsExclude,     // 2, MODE_IS_EXCLUDE
@@ -596,7 +600,7 @@ pub enum IgmpV3RecordType {
 }
 
 /// Одна группа в IGMPv3 Report: INCLUDE/EXCLUDE, multicast-адрес и список источников.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct IgmpV3GroupRecord {
     pub record_type: IgmpV3RecordType,
     pub multicast  : Ipv4Addr,
@@ -604,14 +608,14 @@ pub struct IgmpV3GroupRecord {
 }
 
 /// IGMPv3 Membership Report. Минимум 8 байт + записи групп. RFC 3376.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct IgmpV3Report {
     pub checksum: u16,
     pub records : heapless::Vec<IgmpV3GroupRecord, IGMP_V3_MAX_RECORDS>,
 }
 
 /// Разобранное IGMP-сообщение всех поддерживаемых версий.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum IgmpData {
     V1Query (IgmpV1),
     V1Report(IgmpV1),
@@ -624,7 +628,7 @@ pub enum IgmpData {
 
 
 /// Ethernet-заголовок после разбора: MAC, направление относительно своего интерфейса, EtherType.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Serialize, Deserialize)]
 pub struct EthData {
     pub src : MacAddr6,    // MAC-адрес источника 
     pub dst : MacAddr6,    // MAC-адрес назначения
@@ -633,7 +637,7 @@ pub struct EthData {
 }
 
 /// Откуда кадр относительно MAC своего интерфейса (и multicast/broadcast по младшему биту dst).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EDirection {
     Unknown,
     Incoming,
@@ -643,7 +647,7 @@ pub enum EDirection {
 }
 
 /// Транспорт одного IP-пакета. Порты есть только у TCP и UDP.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum IpL4 {
     Tcp   { src_port: u16, dst_port: u16 },
     Udp   { src_port: u16, dst_port: u16, app: UdpApp, msg: Option<UdpMsg> },
@@ -655,7 +659,7 @@ pub enum IpL4 {
 }
 
 /// IPv4/IPv6: адреса, длина дейтаграммы и один вариант L4.
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct IpData {
     pub src: IpAddr, // IP-адрес отправителя
     pub dst: IpAddr, // IP-адрес получателя
@@ -665,7 +669,7 @@ pub struct IpData {
 
 
 /// Результат разбора одного кадра: Ethernet + payload. Уходит в статистику и на печать.
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct NetData {
     pub eth    : EthData,     // Ethernet-заголовок: src/dst MAC, направление, EtherType
     pub payload: NetPayload,  // L3 payload: разобранный IP/ARP/MPLS/LLDP, либо raw данные
@@ -673,7 +677,7 @@ pub struct NetData {
 
 
 /// Причина неудачного разбора L3/L4 пакета.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Serialize, Deserialize)]
 pub enum ParseError {
     Unknown_Error,
     Unsupported_Eth          { id : u16   },                           // Неизвестный или неподдерживаемый EtherType.

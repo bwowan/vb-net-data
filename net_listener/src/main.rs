@@ -3,15 +3,15 @@
 // For debugging, it is easiest to use a debug server: sudo lldb-server platform --listen "*:1234" --server
 // and connect to it as done in the launch.json file
 
-use std::os::unix::net::UnixDatagram;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio;
 use flume;
 use anyhow::Result;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 mod capture;
 mod console;
 mod device;
+mod ipc_sender;
 mod parser;
 
 
@@ -24,34 +24,6 @@ use tracing_subscriber;
 const POOL_COUNT: usize = 1024;
 
 static SOCKET_PATH: &str = "/tmpu/net_listener_stats2.sock";
-/// Unix-сокет для отдачи статистики наружу. При Drop файл сокета удаляется.
-struct MainChannels {
-    uds           : UnixDatagram,
-}
-impl MainChannels {
-    fn new() -> Option<MainChannels> {
-        let _ = std::fs::remove_file(SOCKET_PATH);
-        let uds = match UnixDatagram::bind(SOCKET_PATH) {
-            Ok(s) => s,
-            Err(e) => {
-                println!("Failed to create UnixDatagram socket: {:?}", e);
-                return Option::None;
-            }
-        };
-        if let Err(e) = uds.set_nonblocking(true) {
-            println!("Failed to set UnixDatagram socket to non-blocking: {:?}", e);
-            return Option::None;
-        }
-        Option::Some(Self {uds})
-    } 
-}
-impl Drop for MainChannels {
-    fn drop(&mut self) {
-        let _ = self.uds.shutdown(std::net::Shutdown::Both);
-        let _ = std::fs::remove_file(SOCKET_PATH);
-    }
-}
-
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -88,52 +60,78 @@ async fn main() -> Result<()> {
     let num_parsers = (cores / 3).min(1);
     println!("Logical cores: {cores}; parser tasks: {num_parsers}");
 
-    let channels = MainChannels::new();
-    if channels.is_none() {
-        println!("Failed to initialize channels.");
-        return Err(anyhow::anyhow!("Failed to initialize channels."));
-    }
-
     let shutdown_flag: Arc<_> = Arc::new(AtomicBool::new(false));
+    let cap_pool = mempool::MemPool::<common::NetData, POOL_COUNT>::new();
+    let pool: &'static mempool::MemPool<common::NetData, POOL_COUNT> = unsafe { &*(&cap_pool as *const _) };
 
     //create pipes capture->parser->client
     let (from_capture_to_parser_sender, from_capture_to_parser_receiver) =
         flume::bounded::<(common::CapData, mempool::PoolSlot<common::NetData>)>(POOL_COUNT / 2);
     let (from_parser_to_client_sender, from_parser_to_client_receiver) =
-        flume::bounded::<mempool::PoolSlot<common::NetData>>(POOL_COUNT);
+        tokio::sync::broadcast::channel::<mempool::PoolSlot<common::NetData>>(POOL_COUNT);
 
-    let pool_clients_number = 1u8;
-    let mut client_handles: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(pool_clients_number as usize);
-    client_handles.push(std::thread::spawn( { let shutdown_flag = shutdown_flag.clone();
-                                              move || console::run(from_parser_to_client_receiver, shutdown_flag)
-                                            } )
-                        );
+    let mut client_handles: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(2usize);
+    client_handles.push(std::thread::spawn({
+        let shutdown_flag = shutdown_flag.clone();
+        || console::run(from_parser_to_client_receiver, shutdown_flag)
+    }));
+    client_handles.push(std::thread::spawn({
+        let shutdown_flag = shutdown_flag.clone();
+        let rx = from_parser_to_client_sender.subscribe();
+        || ipc_sender::run(SOCKET_PATH, rx, shutdown_flag)
+    }));
 
-    let cap_pool = mempool::MemPool::<common::NetData, POOL_COUNT>::new();
 
-    let mut parsers_handles: Vec<tokio::task::JoinHandle<()>> = Vec::with_capacity(num_parsers);
+    let mut parsers_handles: Vec<tokio::task::JoinHandle<()>> = Vec::with_capacity(num_parsers); 
     for _ in 0..num_parsers {
         let rx = from_capture_to_parser_receiver.clone();
         let tx = from_parser_to_client_sender.clone();
-        parsers_handles.push(tokio::spawn(async move { parser::parse_loop(own_mac, rx, tx).await }));
+        let shutdown_flag = shutdown_flag.clone();
+        parsers_handles.push(tokio::spawn(
+            parser::run(own_mac, rx, tx, shutdown_flag)
+        ));   
     }
 
-    tokio::select! {
-        _ = capture::capture_loop(
-            net_device,
-            from_capture_to_parser_sender,
-            shutdown_flag.clone(),
-            &cap_pool,
-            pool_clients_number,
-        ) => shutdown_flag.store(true, Ordering::Relaxed),
-        _ = tokio::signal::ctrl_c()
-          => shutdown_flag.store(true, Ordering::Relaxed),
+    {   let shutdown_flag_clone = shutdown_flag.clone();
+        // oneshot-канал для оповещения, что capture-поток завершён — требуется,
+        // чтобы корректно дождаться завершения цикла захвата и не перепутать его с обычным флагом остановки.
+        // shutdown_flag сигнализирует о необходимости выйти (Ctrl+C), но не гарантирует, что поток уже завершился —
+        // capture_done_rx ждёт именно завершения capture::run (и используется в select).
+        let (capture_done_tx, capture_done_rx) = tokio::sync::oneshot::channel();
+        // Отдельный поток: next_packet блокируется до таймаута pcap и не занимает worker Tokio.
+        // JoinHandle не кладётся в select — проигравшая ветка отменяется, поток нет.
+        let mut capture_thread = Some(std::thread::spawn(move || {
+            capture::run(
+                net_device,
+                from_capture_to_parser_sender,
+                shutdown_flag_clone,
+                pool,
+            );
+            let _ = capture_done_tx.send(());
+        }));
+        tokio::select! {
+            _ = capture_done_rx => {
+                println!("Capture loop finished");
+            }
+            _ = tokio::signal::ctrl_c() => {
+                println!("Ctrl+C received, shutting down...");
+                shutdown_flag.store(true, Ordering::SeqCst);
+                println!("Waiting for capture loop to finish...");
+                if let Some(handle) = capture_thread.take() {
+                    let _ = handle.join();
+                }
+                println!("Capture loop finished");
+            }
+        }
     }
+    shutdown_flag.store(true, Ordering::SeqCst);
 
     println!("Waiting for tasks to finish...");
+    // parsers_handles содержит JoinHandle<()>, создаваемый с помощью tokio::spawn, для них необходимо await внутри async-функции.
     for handle in parsers_handles {
         let _ = handle.await;
     }
+    // client_handles — это обычные OS-потоки с std::thread::spawn и здесь нужен .join(), потому что потоки "выходят" только через join.
     for handle in client_handles {
         let _ = handle.join();
     }

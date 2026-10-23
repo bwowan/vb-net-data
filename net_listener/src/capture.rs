@@ -1,168 +1,152 @@
 use pcap;
 use flume::Sender;
-use std::io;
 use std::sync;
 use std::sync::atomic::Ordering;
+use std::thread;
 use std::time::Duration;
 use common;
-use tokio::io::unix::AsyncFd;
 use tracing::{info, error, warn};
 
+/// Сколько кадров выбросить за одну паузу, если очередь или пул заняты.
+/// Дальше один sleep, чтобы парсер успел освободить очередь.
+const DISCARD_BATCH: usize = 64;
 
-fn open_capture(device: &pcap::Device) -> Option<AsyncFd<pcap::Capture<pcap::Active>>> {
+fn open_capture(device: &pcap::Device) -> Option<pcap::Capture<pcap::Active>> {
     let device_name = device.name.as_str();
 
     let cap = match pcap::Capture::from_device(device_name) {
         Ok(c) => c,
         Err(e) => {
-            error!("Failed to create capture from devicre {}: {:?}", device_name, e);
+            error!("Failed to create capture from device {}: {:?}", device_name, e);
             return None;
         }
     };
 
     info!("CAP: getting device {}; {:?}", device.name, device.desc);
 
-    let cap = match cap
-        .promisc(true) // listen all traffic, not only that which is destined for this host
-        .immediate_mode(true) // not sure, but it seems to reduce latency
+    // immediate_mode выключен: кадры копятся в кольце libpcap.
+    // timeout 1 мс — верхняя задержка кадра и шаг, с которым виден shutdown.
+    match cap
+        .promisc(true)
+        .immediate_mode(false)
+        .timeout(1)
         .snaplen(65535)
         .buffer_size(16 * 1024 * 1024)
         .open()
     {
-        Ok(c) => c,
-        Err(e) => {
-            error!("Capture device {}: {:?}", device_name, e);
-            return None;
-        }
-    };
-
-    let cap = match cap.setnonblock() {
-        Ok(c) => c,
-        Err(e) => {
-            error!("Set nonblock on device {}: {:?}", device_name, e);
-            return None;
-        }
-    };
-
-    match AsyncFd::new(cap) {
         Ok(c) => Some(c),
         Err(e) => {
-            error!("AsyncFd for device {}: {:?}", device_name, e);
+            error!("Capture device {}: {:?}", device_name, e);
             None
         }
     }
 }
 
 
-/// Packet capture loop using a nonblocking `pcap` fd waited on by Tokio.
-pub async fn capture_loop(
+/// Захват пакетов. Блокирующий `next_packet`, вызывать с отдельного потока.
+pub fn run(
     device: pcap::Device,
     sender: Sender<(common::CapData, mempool::PoolSlot<common::NetData>)>,
     shutdown_flag: sync::Arc<sync::atomic::AtomicBool>,
-    pool_acqure: &(dyn mempool::PoolAcquire<common::NetData> + Sync),
-    pool_clients_number: u8,
+    pool_acquire: &'static (dyn mempool::PoolAcquire<common::NetData> + Sync),
 ) {
     info!("CAP: enter capture");
 
     let device_name = device.name.clone();
+    let mut lost_packets: u64 = 0;
+
     let Some(mut cap) = open_capture(&device) else {
-        shutdown_flag.store(true, Ordering::Relaxed);
+        error!("CAP: failed to open capture on device {}", device.name);
         return;
     };
 
-    info!("CAP: start loop");
-
-    let mut lost_packets: u64 = 0;
-    let mut pending_slot: Option<mempool::PoolSlot<common::NetData>> = None;
-
-    let mut do_break = false;
-    while !do_break {
-        let guard = cap.readable_mut().await;
-        if let Err(e) = guard {
-            error!("Capture wait on device {}: {:?}", device_name, e);
-            do_break = true;
-            continue;
-        }
-        
-        let mut guard = guard.unwrap();
-        let mut do_sleep = false;
-        while !do_break {
-            if do_sleep {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-                do_sleep = false;
-            }
-            if sender.is_full() { // Полная очередь: пакет всё равно забираем из pcap, иначе fd останется готовым.
-                match guard.try_io (|fd| discard_packet(fd))
-                {
-                    Ok(Ok(())) => {
-                        lost_packets += 1;
-                        do_sleep = true;
-                    }
-                    Ok(Err(e)) => {
-                        error!("Capture error on device {}: {:?}", device_name, e);
-                        do_break = true;
-                    }
-                    Err(_) => break,
-                }
-                continue;
-            }
-            match guard.try_io(read_packet) {
-                Ok(Ok(cap_data)) => {
-                    let slot = pending_slot.take().or_else(|| pool_acqure.acquire(pool_clients_number));
-                    if let Some(slot) = slot {
+    while !shutdown_flag.load(Ordering::Relaxed) {
+        match cap.next_packet() {
+            Ok(packet) => {
+                if !sender.is_full() {
+                    if let Some(slot) = pool_acquire.acquire() {
+                        let cap_data = copy_packet(&packet);
+                        drop(packet);
                         match sender.try_send((cap_data, slot)) {
-                            Ok(_) => { 
-                                pending_slot = None;
-                            }
-                            Err(flume::TrySendError::Full((_, slot))) => {
-                                pending_slot = Some(slot);
+                            Ok(()) => {}
+                            Err(flume::TrySendError::Full((cap_data, _slot))) => {
+                                mempool::recycle_packet_buf(cap_data.data);
                                 lost_packets += 1;
-                                do_sleep = true;
+                                if !pause_for_consumers(&mut cap, &mut lost_packets, &device_name) {
+                                    break;
+                                }
                             }
-                            Err(flume::TrySendError::Disconnected(_)) => {
-                                do_break = true;
+                            Err(flume::TrySendError::Disconnected((cap_data, _slot))) => {
+                                mempool::recycle_packet_buf(cap_data.data);
                                 info!("Receivers dropped, stopping capture loop on device {}", device_name);
+                                break;
                             }
                         }
-                    } else {
-                        lost_packets += 1;
-                        do_sleep = true;
-                    }                    
+                        continue;
+                    }
                 }
-                Ok(Err(e)) => {
-                    error!("Capture error on device {}: {:?}", device_name, e);
-                    do_break = true;
+                drop(packet);
+                lost_packets += 1;
+                if !pause_for_consumers(&mut cap, &mut lost_packets, &device_name) {
+                    break;
                 }
-                Err(_) => break,
+            }
+            Err(pcap::Error::TimeoutExpired) => {}
+            Err(e) => {
+                error!("Capture error on device {}: {:?}", device_name, e);
+                break;
             }
         }
     }
-    
-    shutdown_flag.store(true, Ordering::Relaxed);
+
     if lost_packets > 0 {
         warn!("CAP: dropped {lost_packets} packets on {device_name}");
     }
     info!("CAP: leave capture");
 }
 
-
-fn read_packet(fd: &mut AsyncFd<pcap::Capture<pcap::Active>>) -> io::Result<common::CapData> {
-    match fd.get_mut().next_packet() {
-        Ok(packet)           => Ok(common::CapData {
-                                                cap_len : packet.header.caplen as usize,
-                                                orig_len: packet.header.len as usize,
-                                                data    : packet.data.to_vec(),
-                                            }),
-        Err(pcap::Error::TimeoutExpired) => Err(io::Error::new(io::ErrorKind::WouldBlock, "timeout expired to read packet")),
-        Err(e)                    => Err(io::Error::other(format!("{e:?}"))),
+fn copy_packet(packet: &pcap::Packet) -> common::CapData {
+    let mut data = mempool::take_packet_buf(packet.data.len());
+    data.extend_from_slice(packet.data);
+    common::CapData {
+        cap_len : packet.header.caplen as usize,
+        orig_len: packet.header.len as usize,
+        data,
     }
 }
 
-fn discard_packet(fd: &mut AsyncFd<pcap::Capture<pcap::Active>>) -> io::Result<()> {
-    match fd.get_mut().next_packet() {
-        Ok(_)                            => Ok(()),
-        Err(pcap::Error::TimeoutExpired) => Err(io::Error::new(io::ErrorKind::WouldBlock, "timeout expired to discard packet")),
-        Err(e)                    => Err(io::Error::other(format!("{e:?}"))),
+/// Выбрасывает ещё до [`DISCARD_BATCH`] кадров без копии.
+/// `Ok(true)` — буфер pcap пуст, ядро уже подождало таймаут.
+/// `Ok(false)` — пачка заполнена, в кольце ещё могут быть кадры.
+fn discard_batch(
+    cap: &mut pcap::Capture<pcap::Active>,
+    lost: &mut u64,
+) -> Result<bool, pcap::Error> {
+    for _ in 0..DISCARD_BATCH {
+        match cap.next_packet() {
+            Ok(_) => *lost += 1,
+            Err(pcap::Error::TimeoutExpired) => return Ok(true),
+            Err(e) => return Err(e),
+        }
     }
+    Ok(false)
 }
 
+fn pause_for_consumers(
+    cap: &mut pcap::Capture<pcap::Active>,
+    lost: &mut u64,
+    device_name: &str,
+) -> bool {
+    match discard_batch(cap, lost) {
+        Ok(idle) => {
+            if !idle {
+                thread::sleep(Duration::from_millis(1));
+            }
+            true
+        }
+        Err(e) => {
+            error!("Capture error on device {}: {:?}", device_name, e);
+            false
+        }
+    }
+}

@@ -23,7 +23,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 use ratatui::Terminal;
-use flume;
+use tokio::sync::broadcast::{self, error::TryRecvError};
 
 const FLOW_CAP   : usize    = 4096;
 const ADDR_CAP   : usize    = 4096;
@@ -486,7 +486,14 @@ struct Model {
     redraw:        bool,
 }
 
-pub fn run(mut rx: flume::Receiver<mempool::PoolSlot<NetData>>, shutdown: Arc<AtomicBool>) {
+struct SlotRx {
+    rx: broadcast::Receiver<mempool::PoolSlot<NetData>>,
+}
+
+pub fn run(rx: broadcast::Receiver<mempool::PoolSlot<NetData>>,
+           shutdown: Arc<AtomicBool>)
+{
+    let mut rx = SlotRx { rx };
     let _guard = scopeguard::guard((), |_| restore_terminal());
     if enable_raw_mode().is_err() {
         return;
@@ -540,15 +547,15 @@ fn restore_terminal() {
     let _ = execute!(out, LeaveAlternateScreen);
 }
 
-fn drain(rx: &mut flume::Receiver<mempool::PoolSlot<NetData>>, model: &mut Model) -> bool {
+fn drain(rx: &mut SlotRx, model: &mut Model) -> bool {
     for _ in 0..DRAIN_BURST {
-        match rx.try_recv() {
+        match rx.rx.try_recv() {
             Ok(slot) => {
-                let data = unsafe { &*slot.body };
-                model.ingest(data);
+                model.ingest(unsafe { &*slot.body });
             }
-            Err(flume::TryRecvError::Empty)        => return true,
-            Err(flume::TryRecvError::Disconnected) => return false,
+            Err(TryRecvError::Empty)     => return true,
+            Err(TryRecvError::Lagged(_)) => continue,
+            Err(TryRecvError::Closed)    => return false,
         }
     }
     true
