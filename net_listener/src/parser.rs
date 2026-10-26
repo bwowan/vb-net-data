@@ -19,7 +19,7 @@ pub fn get_mac_address(device_name: &str) -> Option<common::MacAddr6> {
 
 
 pub async fn run(own_mac      : common::MacAddr6,
-                 receiver     : flume::Receiver<(common::CapData, mempool::PoolSlot<common::NetData>)>,
+                 receiver     : flume::Receiver<mempool::PoolSlot<common::NetData>>,
                  sender       : tokio::sync::broadcast::Sender<mempool::PoolSlot<common::NetData>>,
                  shutdown_flag: sync::Arc<sync::atomic::AtomicBool>)
 {
@@ -30,9 +30,11 @@ pub async fn run(own_mac      : common::MacAddr6,
                 eprintln!("PARSER: error read from receiver - {e:?}");
                 break;
             }
-            Ok((data, slot)) => {
-                let parsed = parse_ethernet_packet(&data, own_mac);
-                mempool::recycle_packet_buf(data.data);
+            Ok(slot) => {
+                let parsed = {
+                    let bytes = unsafe { std::slice::from_raw_parts(slot.bin.cast::<u8>(), slot.cap_len) };
+                    parse_ethernet_packet(bytes, own_mac)
+                };
                 match parsed {
                     Ok(net_data) => {
                         unsafe { std::ptr::write(slot.body, net_data); }
@@ -88,10 +90,10 @@ fn get_direction(src: &common::MacAddr6, dst: &common::MacAddr6, own_mac: &commo
 
 
 // ── Ethernet ────────────────────────────────────────────────────────────────
-fn parse_ethernet_packet(data: &common::CapData, own_mac: common::MacAddr6) -> Result<common::NetData, common::ParseError> {
-    let (eth_header, eth_payload) = etherparse::Ethernet2Header::from_slice(&data.data).map_err(|e| {
+fn parse_ethernet_packet(data: &[u8], own_mac: common::MacAddr6) -> Result<common::NetData, common::ParseError> {
+    let (eth_header, eth_payload) = etherparse::Ethernet2Header::from_slice(data).map_err(|e| {
             eprintln!("{e:?}");
-            common::ParseError::Eth_Broken { len: data.data.len() }
+            common::ParseError::Eth_Broken { len: data.len() }
         })?;
     
     let (src, dst) = (common::MacAddr6::new(eth_header.source), common::MacAddr6::new(eth_header.destination));
@@ -115,9 +117,9 @@ fn parse_ethernet_packet(data: &common::CapData, own_mac: common::MacAddr6) -> R
             Ok(common::NetData { eth: eth_data, payload: r })
         }
         Err(e) => {
-            let dump_len = min(128, data.data.len());
-            eprintln!("PARSER: packet {} bytes, first {}:", data.data.len(), dump_len);
-            for (i, b) in data.data[..dump_len].iter().enumerate() {
+            let dump_len = min(128, data.len());
+            eprintln!("PARSER: packet {} bytes, first {}:", data.len(), dump_len);
+            for (i, b) in data[..dump_len].iter().enumerate() {
                 if i % 16 == 0 {
                     eprint!("  {i:04x}: ");
                 }
@@ -3676,7 +3678,7 @@ Location: http://192.168.0.2/desc.xml\r\n\
         ];
         for (dst, src, dir) in cases {
             let frame = eth_frame(dst, src, 0x0806, &arp);
-            let net = parse_ethernet_packet(&frame, common::MacAddr6::new(own)).expect("arp frame");
+            let net = parse_ethernet_packet(&frame.data, common::MacAddr6::new(own)).expect("arp frame");
             assert!(net.eth.dir == dir);
             assert!(net.eth.prot == common::EthType::Arp);
         }
@@ -3689,7 +3691,7 @@ Location: http://192.168.0.2/desc.xml\r\n\
         let target_mac = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
         let arp = arp_bytes(1, sender_mac, [10, 0, 0, 2], target_mac, [10, 0, 0, 1]);
         let frame = eth_frame([0xff; 6], sender_mac, 0x0806, &arp);
-        let net = parse_ethernet_packet(&frame, common::MacAddr6::new(sender_mac)).expect("arp");
+        let net = parse_ethernet_packet(&frame.data, common::MacAddr6::new(sender_mac)).expect("arp");
         match net.payload {
             common::NetPayload::Arp(a) => {
                 assert!(a.op == common::ArpOp::Request);
@@ -3712,7 +3714,7 @@ Location: http://192.168.0.2/desc.xml\r\n\
             0x8847,
             &word.to_be_bytes(),
         );
-        let net = parse_ethernet_packet(&frame, common::MacAddr6::empty()).expect("mpls");
+        let net = parse_ethernet_packet(&frame.data, common::MacAddr6::empty()).expect("mpls");
         assert!(net.eth.prot == common::EthType::Mpls);
         match net.payload {
             common::NetPayload::Mpls(m) => {
@@ -3738,7 +3740,7 @@ Location: http://192.168.0.2/desc.xml\r\n\
             snap.len() as u16,
             &snap,
         );
-        let net = parse_ethernet_packet(&frame, common::MacAddr6::empty()).expect("cdp snap");
+        let net = parse_ethernet_packet(&frame.data, common::MacAddr6::empty()).expect("cdp snap");
         match net.payload {
             common::NetPayload::Cisco(common::CiscoData::CDP(data)) => {
                 assert_eq!(data.Header.ver, 2);

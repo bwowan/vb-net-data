@@ -65,27 +65,27 @@ async fn main() -> Result<()> {
     let pool: &'static mempool::MemPool<common::NetData, POOL_COUNT> = unsafe { &*(&cap_pool as *const _) };
 
     //create pipes capture->parser->client
-    let (from_capture_to_parser_sender, from_capture_to_parser_receiver) =
-        flume::bounded::<(common::CapData, mempool::PoolSlot<common::NetData>)>(POOL_COUNT / 2);
-    let (from_parser_to_client_sender, from_parser_to_client_receiver) =
+    let (capture_2_parser_sender, capture_2_parser_receiver) =
+        flume::bounded::<mempool::PoolSlot<common::NetData>>(POOL_COUNT / 2);
+    let (parser_2_client_sender, parser_2_client_receiver) =
         tokio::sync::broadcast::channel::<mempool::PoolSlot<common::NetData>>(POOL_COUNT);
 
     let mut client_handles: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(2usize);
     client_handles.push(std::thread::spawn({
         let shutdown_flag = shutdown_flag.clone();
-        || console::run(from_parser_to_client_receiver, shutdown_flag)
+        || console::run(parser_2_client_receiver, shutdown_flag)
     }));
     client_handles.push(std::thread::spawn({
         let shutdown_flag = shutdown_flag.clone();
-        let rx = from_parser_to_client_sender.subscribe();
+        let rx = parser_2_client_sender.subscribe();
         || ipc_sender::run(SOCKET_PATH, rx, shutdown_flag)
     }));
 
 
     let mut parsers_handles: Vec<tokio::task::JoinHandle<()>> = Vec::with_capacity(num_parsers); 
     for _ in 0..num_parsers {
-        let rx = from_capture_to_parser_receiver.clone();
-        let tx = from_parser_to_client_sender.clone();
+        let rx = capture_2_parser_receiver.clone();
+        let tx = parser_2_client_sender.clone();
         let shutdown_flag = shutdown_flag.clone();
         parsers_handles.push(tokio::spawn(
             parser::run(own_mac, rx, tx, shutdown_flag)
@@ -103,7 +103,7 @@ async fn main() -> Result<()> {
         let mut capture_thread = Some(std::thread::spawn(move || {
             capture::run(
                 net_device,
-                from_capture_to_parser_sender,
+                capture_2_parser_sender,
                 shutdown_flag_clone,
                 pool,
             );
