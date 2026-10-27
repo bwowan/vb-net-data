@@ -301,8 +301,10 @@ fn udp_payload_slice(length: u16, rest: &[u8]) -> &[u8] {
 }
 
 /// DNS/mDNS/LLMNR: первое имя вопроса и первая SRV в ответах.
-/// mDNS ещё: метки `_service._proto` и первая PTR. DHCP: magic cookie, опции 53, 12 и 50.
-/// DHCPv6: первый байт — тип. NBNS: имя из 32 символов A–P. SSDP: первая строка и заголовки NT, USN, LOCATION.
+/// mDNS ещё: метки `_service._proto`, первая PTR, первые A/AAAA и TXT.
+/// DHCP: magic cookie, опции 53, 12, 50, 3, 6, 54, 51 и 15.
+/// DHCPv6: тип, у не-relay ещё адрес IA_NA и DNS. NBNS: имя из 32 символов A–P.
+/// SSDP: первая строка и заголовки NT, USN, LOCATION.
 /// Тело не сошлось — ярлык по порту снимается, пакет остаётся обычным UDP.
 fn confirm_udp_body(data: &mut common::IpData, body: &[u8]) {
     let common::IpL4::Udp { app, msg, .. } = &mut data.l4 else { return };
@@ -328,8 +330,13 @@ fn confirm_udp_body(data: &mut common::IpData, body: &[u8]) {
                 if *app != common::UdpApp::Mdns {
                     q.service = None;
                     q.ptr = None;
+                    q.a = None;
+                    q.aaaa = None;
+                    q.txt = None;
                 }
-                *msg = Some(common::UdpMsg::Query(q));
+                if q.name.is_some() || q.srv.is_some() || q.ptr.is_some() || q.a.is_some() || q.aaaa.is_some() || q.txt.is_some() {
+                    *msg = Some(common::UdpMsg::Query(q));
+                }
             }
             Ok(None) => {}
             Err(()) => *app = common::UdpApp::Other,
@@ -340,7 +347,10 @@ fn confirm_udp_body(data: &mut common::IpData, body: &[u8]) {
 
 const DNS_HEADER_LEN: usize = 12;
 const DNS_PTR_HOPS: usize = 8;
+const DNS_TYPE_A: u16 = 1;
 const DNS_TYPE_PTR: u16 = 12;
+const DNS_TYPE_TXT: u16 = 16;
+const DNS_TYPE_AAAA: u16 = 28;
 const DNS_TYPE_SRV: u16 = 33;
 const DNS_SRV_FIXED: usize = 6; // priority, weight, port
 const NBNS_TYPE_NB: u16 = 0x0020;
@@ -349,24 +359,36 @@ const NBNS_RDATA_MIN: usize = 6; // flags + IPv4
 const DHCP4_COOKIE_AT: usize = 236;
 const DHCP4_OPTIONS_AT: usize = 240;
 const DHCP4_COOKIE: [u8; 4] = [0x63, 0x82, 0x53, 0x63];
+const DHCP4_OPT_ROUTER: u8 = 3;
+const DHCP4_OPT_DNS: u8 = 6;
 const DHCP4_OPT_HOST: u8 = 12;
+const DHCP4_OPT_DOMAIN: u8 = 15;
 const DHCP4_OPT_REQ_ADDR: u8 = 50;
+const DHCP4_OPT_LEASE: u8 = 51;
 const DHCP4_OPT_MSG_TYPE: u8 = 53;
+const DHCP4_OPT_SERVER: u8 = 54;
 const DHCP4_OPT_END: u8 = 255;
 const DHCP4_OPT_PAD: u8 = 0;
 const DHCP6_MSG_MIN: usize = 4;   // type + transaction-id
 const DHCP6_RELAY_MIN: usize = 34; // type, hop-count, link-address, peer-address
+const DHCP6_OPT_IA_NA: u16 = 3;
+const DHCP6_OPT_IAADDR: u16 = 5;
+const DHCP6_OPT_DNS: u16 = 23;
+const DHCP6_IANA_HDR: usize = 12; // IAID, T1, T2
 
-/// `Ok(None)` — заголовок есть, ни вопроса, ни целой SRV, ни целой PTR. `Err` — битое первое имя вопроса.
-/// Первая SRV в ответах: порт и целевой хост. Короче 7 байт или имя вне rdata — запись пропускается.
-/// Первая PTR: имя из rdata. `service` — первые метки `_service._proto` (вопрос, затем владелец PTR, rdata PTR, владелец SRV).
-/// Обрезанный ответ останавливает обход: уже прочитанные вопрос, PTR и SRV сохраняются, недостающее не выдумывается.
+/// `Ok(None)` — заголовок есть, но ни вопроса, ни целой SRV, PTR, A, AAAA или TXT. `Err` — битое первое имя вопроса.
+/// Первая SRV: порт и целевой хост. Короче 7 байт или имя вне rdata — запись пропускается.
+/// Первая PTR: имя из rdata. `service` — метки `_service._proto` (вопрос, затем владелец PTR, rdata PTR, владелец SRV).
+/// A, AAAA и TXT ищутся в answer, authority и additional. Обрыв секции не даёт перейти к следующей.
+/// Обрезанная запись останавливает обход: уже прочитанное сохраняется, недостающее не выдумывается.
 fn parse_dns_msg(body: &[u8]) -> Result<Option<common::DnsQuery>, ()> {
     if body.len() < DNS_HEADER_LEN {
         return Err(());
     }
     let qd = u16::from_be_bytes([body[4], body[5]]);
     let an = u16::from_be_bytes([body[6], body[7]]);
+    let ns = u16::from_be_bytes([body[8], body[9]]);
+    let ar = u16::from_be_bytes([body[10], body[11]]);
     let mut pos = DNS_HEADER_LEN;
     let mut name = None;
     let mut service = None;
@@ -380,12 +402,12 @@ fn parse_dns_msg(body: &[u8]) -> Result<Option<common::DnsQuery>, ()> {
         pos = end + 4;
         for _ in 1..qd {
             let Some(next) = skip_dns_question(body, pos) else {
-                return Ok(Some(common::DnsQuery { name, srv: None, service, ptr: None }));
+                return Ok(Some(dns_query(name, service, DnsAnswers::empty())));
             };
             pos = next;
         }
     }
-    let found = dns_answers(body, pos, an);
+    let found = dns_records(body, pos, an, ns, ar);
     if service.is_none() {
         service = found.ptr_owner.as_ref().and_then(|n| mdns_service(n));
     }
@@ -395,10 +417,26 @@ fn parse_dns_msg(body: &[u8]) -> Result<Option<common::DnsQuery>, ()> {
     if service.is_none() {
         service = found.srv_owner.as_ref().and_then(|n| mdns_service(n));
     }
-    if name.is_none() && found.srv.is_none() && found.ptr.is_none() {
+    if name.is_none() && found.srv.is_none() && found.ptr.is_none() && found.a.is_none() && found.aaaa.is_none() && found.txt.is_none() {
         Ok(None)
     } else {
-        Ok(Some(common::DnsQuery { name, srv: found.srv, service, ptr: found.ptr }))
+        Ok(Some(dns_query(name, service, found)))
+    }
+}
+
+fn dns_query(
+    name: Option<heapless::String<{ common::UDP_QNAME_MAX }>>,
+    service: Option<heapless::String<{ common::UDP_QNAME_MAX }>>,
+    found: DnsAnswers,
+) -> common::DnsQuery {
+    common::DnsQuery {
+        name,
+        srv: found.srv,
+        service,
+        ptr: found.ptr,
+        a: found.a,
+        aaaa: found.aaaa,
+        txt: found.txt,
     }
 }
 
@@ -407,6 +445,27 @@ struct DnsAnswers {
     ptr: Option<heapless::String<{ common::UDP_QNAME_MAX }>>,
     ptr_owner: Option<heapless::String<{ common::UDP_QNAME_MAX }>>,
     srv_owner: Option<heapless::String<{ common::UDP_QNAME_MAX }>>,
+    a: Option<common::Ipv4Addr>,
+    aaaa: Option<common::Ipv6Addr>,
+    txt: Option<heapless::String<{ common::UDP_TXT_MAX }>>,
+}
+
+impl DnsAnswers {
+    fn empty() -> Self {
+        Self {
+            srv: None,
+            ptr: None,
+            ptr_owner: None,
+            srv_owner: None,
+            a: None,
+            aaaa: None,
+            txt: None,
+        }
+    }
+
+    fn filled(&self) -> bool {
+        self.srv.is_some() && self.ptr.is_some() && self.a.is_some() && self.aaaa.is_some() && self.txt.is_some()
+    }
 }
 
 fn skip_dns_question(body: &[u8], pos: usize) -> Option<usize> {
@@ -415,25 +474,38 @@ fn skip_dns_question(body: &[u8], pos: usize) -> Option<usize> {
     if next > body.len() { None } else { Some(next) }
 }
 
-/// Первые целые PTR и SRV среди `an` записей с позиции `pos`. Приоритет и вес SRV не читаются.
-/// Обрезанная запись останавливает обход и оставляет уже найденное.
-fn dns_answers(body: &[u8], mut pos: usize, an: u16) -> DnsAnswers {
-    let mut found = DnsAnswers { srv: None, ptr: None, ptr_owner: None, srv_owner: None };
-    for _ in 0..an {
-        if found.srv.is_some() && found.ptr.is_some() {
+/// Первые целые PTR, SRV, A, AAAA и TXT. Секции answer, authority, additional — по очереди.
+/// Приоритет и вес SRV не читаются. Обрезанная запись останавливает обход и оставляет уже найденное.
+/// shortcut: первая A/AAAA в пакете, без сверки с хостом SRV — сверять, когда в одном пакете несколько сервисов.
+fn dns_records(body: &[u8], mut pos: usize, an: u16, ns: u16, ar: u16) -> DnsAnswers {
+    let mut found = DnsAnswers::empty();
+    for count in [an, ns, ar] {
+        if found.filled() {
             break;
         }
-        let Ok((owner, name_end)) = read_dns_name(body, pos) else {
-            break;
-        };
+        match dns_section(body, pos, count, &mut found) {
+            Some(next) => pos = next,
+            None => break,
+        }
+    }
+    found
+}
+
+/// `Some` — секция кончилась или всё нужное уже найдено. `None` — запись обрезана, дальше не читать.
+fn dns_section(body: &[u8], mut pos: usize, count: u16, found: &mut DnsAnswers) -> Option<usize> {
+    for _ in 0..count {
+        if found.filled() {
+            return Some(pos);
+        }
+        let (owner, name_end) = read_dns_name(body, pos).ok()?;
         if name_end + 10 > body.len() {
-            break;
+            return None;
         }
         let rr_type = u16::from_be_bytes([body[name_end], body[name_end + 1]]);
         let rdlen = u16::from_be_bytes([body[name_end + 8], body[name_end + 9]]) as usize;
         let rdata = name_end + 10;
         if rdata + rdlen > body.len() {
-            break;
+            return None;
         }
         if rr_type == DNS_TYPE_SRV && found.srv.is_none() {
             if let Some(srv) = parse_srv_rdata(body, rdata, rdlen) {
@@ -445,10 +517,18 @@ fn dns_answers(body: &[u8], mut pos: usize, an: u16) -> DnsAnswers {
                 found.ptr = Some(target);
                 found.ptr_owner = Some(owner);
             }
+        } else if rr_type == DNS_TYPE_A && found.a.is_none() && rdlen == 4 {
+            found.a = Some(common::Ipv4Addr::new(body[rdata], body[rdata + 1], body[rdata + 2], body[rdata + 3]));
+        } else if rr_type == DNS_TYPE_AAAA && found.aaaa.is_none() && rdlen == 16 {
+            found.aaaa = ipv6_addr_from(&body[rdata..]);
+        } else if rr_type == DNS_TYPE_TXT && found.txt.is_none() {
+            if let Some(txt) = parse_txt_rdata(body, rdata, rdlen) {
+                found.txt = Some(txt);
+            }
         }
         pos = rdata + rdlen;
     }
-    found
+    Some(pos)
 }
 
 fn parse_ptr_rdata(
@@ -464,6 +544,39 @@ fn parse_ptr_rdata(
         return None;
     }
     Some(name)
+}
+
+/// Строки TXT склеиваются через пробел. Пробел внутри сохраняется, прочее непечатное — `?`.
+/// Длина одной строки за rdata — запись целиком пропускается.
+fn parse_txt_rdata(
+    body: &[u8],
+    rdata: usize,
+    rdlen: usize,
+) -> Option<heapless::String<{ common::UDP_TXT_MAX }>> {
+    if rdlen == 0 {
+        return None;
+    }
+    let data = &body[rdata..rdata + rdlen];
+    let mut out = heapless::String::new();
+    let mut i = 0;
+    while i < data.len() {
+        let n = data[i] as usize;
+        i += 1;
+        if i + n > data.len() {
+            return None;
+        }
+        if n > 0 && !out.is_empty() && out.push(' ').is_err() {
+            return Some(out);
+        }
+        for &b in &data[i..i + n] {
+            let c = if b == b' ' || b.is_ascii_graphic() { b as char } else { '?' };
+            if out.push(c).is_err() {
+                return Some(out);
+            }
+        }
+        i += n;
+    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 /// Две соседние метки, обе с `_`: `_ipp._tcp` из `_ipp._tcp.local` или `Office._ipp._tcp.local`.
@@ -562,7 +675,7 @@ fn push_dns_label(out: &mut heapless::String<{ common::UDP_QNAME_MAX }>, label: 
 }
 
 /// `Some` — cookie есть. `None` — это не DHCP.
-/// Опция 12 длиннее 64 символов обрезается. Опция 50 короче или длиннее 4 байт пропускается.
+/// Опция 12 и 15 длиннее 64 символов обрезаются. Адрес не из 4 байт и список не кратный 4 пропускаются.
 /// Обрезанная опция останавливает обход: уже прочитанные поля сохраняются.
 fn parse_dhcp4(body: &[u8]) -> Option<common::UdpMsg> {
     if body.len() < DHCP4_OPTIONS_AT || body[DHCP4_COOKIE_AT..DHCP4_OPTIONS_AT] != DHCP4_COOKIE {
@@ -571,6 +684,11 @@ fn parse_dhcp4(body: &[u8]) -> Option<common::UdpMsg> {
     let mut msg = None;
     let mut host = None;
     let mut requested = None;
+    let mut router = None;
+    let mut dns = heapless::Vec::new();
+    let mut server = None;
+    let mut lease = None;
+    let mut domain = None;
     let mut i = DHCP4_OPTIONS_AT;
     while i < body.len() {
         let code = body[i];
@@ -597,24 +715,108 @@ fn parse_dhcp4(body: &[u8]) -> Option<common::UdpMsg> {
                 host = Some(dhcp4_hostname(value));
             }
             DHCP4_OPT_REQ_ADDR if requested.is_none() && value.len() == 4 => {
-                requested = Some(common::Ipv4Addr::new(value[0], value[1], value[2], value[3]));
+                requested = Some(ipv4_addr(value));
+            }
+            DHCP4_OPT_ROUTER if router.is_none() && value.len() >= 4 && value.len() % 4 == 0 => {
+                router = Some(ipv4_addr(value));
+            }
+            DHCP4_OPT_DNS if dns.is_empty() && value.len() >= 4 && value.len() % 4 == 0 => {
+                for chunk in value.chunks_exact(4) {
+                    if dns.len() == common::DHCP4_MAX_DNS {
+                        break;
+                    }
+                    let _ = dns.push(ipv4_addr(chunk));
+                }
+            }
+            DHCP4_OPT_SERVER if server.is_none() && value.len() == 4 => {
+                server = Some(ipv4_addr(value));
+            }
+            DHCP4_OPT_LEASE if lease.is_none() && value.len() == 4 => {
+                lease = Some(u32::from_be_bytes([value[0], value[1], value[2], value[3]]));
+            }
+            DHCP4_OPT_DOMAIN if domain.is_none() && !value.is_empty() => {
+                domain = Some(dhcp4_hostname(value));
             }
             _ => {}
         }
         i += 2 + len;
     }
-    Some(common::UdpMsg::Dhcp4 { msg, host, requested })
+    Some(common::UdpMsg::Dhcp4 { msg, host, requested, router, dns, server, lease, domain })
+}
+
+fn ipv4_addr(value: &[u8]) -> common::Ipv4Addr {
+    common::Ipv4Addr::new(value[0], value[1], value[2], value[3])
 }
 
 /// `Some` — тип 1–11 и не короче 4 байт, либо relay 12–13 и не короче 34.
-/// `None` — это не DHCPv6. Transaction-id и опции не читаются.
+/// `None` — это не DHCPv6. У не-relay читаются IA_NA и DNS. Relay остаётся только типом.
+/// shortcut: relay не разбирается, адрес внутри Relay Message — читать, когда такой трафик есть в сети.
 fn parse_dhcp6(body: &[u8]) -> Option<common::UdpMsg> {
     let msg = common::Dhcp6Msg::from_u8(*body.first()?)?;
     let min = if msg.is_relay() { DHCP6_RELAY_MIN } else { DHCP6_MSG_MIN };
     if body.len() < min {
         return None;
     }
-    Some(common::UdpMsg::Dhcp6 { msg })
+    let (addr, dns) = if msg.is_relay() {
+        (None, heapless::Vec::new())
+    } else {
+        dhcp6_options(&body[DHCP6_MSG_MIN..])
+    };
+    Some(common::UdpMsg::Dhcp6 { msg, addr, dns })
+}
+
+fn dhcp6_options(opts: &[u8]) -> (Option<common::Ipv6Addr>, heapless::Vec<common::Ipv6Addr, { common::DHCP6_MAX_DNS }>) {
+    let mut addr = None;
+    let mut dns = heapless::Vec::new();
+    let mut i = 0;
+    while i + 4 <= opts.len() {
+        let code = u16::from_be_bytes([opts[i], opts[i + 1]]);
+        let len = u16::from_be_bytes([opts[i + 2], opts[i + 3]]) as usize;
+        if i + 4 + len > opts.len() {
+            break;
+        }
+        let value = &opts[i + 4..i + 4 + len];
+        match code {
+            DHCP6_OPT_IA_NA if addr.is_none() => {
+                if let Some(found) = dhcp6_ia_na_addr(value) {
+                    addr = Some(found);
+                }
+            }
+            DHCP6_OPT_DNS if dns.is_empty() && len >= 16 && len % 16 == 0 => {
+                for chunk in value.chunks_exact(16) {
+                    if dns.len() == common::DHCP6_MAX_DNS {
+                        break;
+                    }
+                    if let Some(ip) = ipv6_addr_from(chunk) {
+                        let _ = dns.push(ip);
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 4 + len;
+    }
+    (addr, dns)
+}
+
+/// Первый IAADDR (опция 5, не короче 16 байт) внутри IA_NA. Сроки не читаются.
+fn dhcp6_ia_na_addr(value: &[u8]) -> Option<common::Ipv6Addr> {
+    if value.len() < DHCP6_IANA_HDR {
+        return None;
+    }
+    let mut i = DHCP6_IANA_HDR;
+    while i + 4 <= value.len() {
+        let code = u16::from_be_bytes([value[i], value[i + 1]]);
+        let len = u16::from_be_bytes([value[i + 2], value[i + 3]]) as usize;
+        if i + 4 + len > value.len() {
+            return None;
+        }
+        if code == DHCP6_OPT_IAADDR && len >= 16 {
+            return ipv6_addr_from(&value[i + 4..]);
+        }
+        i += 4 + len;
+    }
+    None
 }
 
 struct NbnsDecoded {
@@ -1172,6 +1374,121 @@ fn parse_mld_group(rest: &[u8]) -> Option<common::Ipv6Addr> {
     ipv6_addr_from(rest)
 }
 
+struct RaFields {
+    mtu: Option<u32>,
+    prefixes: heapless::Vec<common::RaPrefix, { common::RA_MAX_PREFIXES }>,
+    dns: heapless::Vec<common::Ipv6Addr, { common::RA_MAX_DNS }>,
+    domain: Option<heapless::String<{ common::UDP_QNAME_MAX }>>,
+}
+
+fn ra_message(hop_limit: u8, managed: bool, other_config: bool, lifetime: u16, rest: &[u8]) -> common::Icmp6Data {
+    let fields = ra_options(rest);
+    common::Icmp6Data::RouterAdvertisement {
+        hop_limit,
+        managed,
+        other_config,
+        lifetime,
+        mtu: fields.mtu,
+        prefixes: fields.prefixes,
+        dns: fields.dns,
+        domain: fields.domain,
+    }
+}
+
+/// Опции RA после Reachable Time и Retrans Timer (8 байт). Длина 0 или заявка за край среза останавливает обход.
+/// shortcut: не больше RA_MAX_PREFIXES и RA_MAX_DNS, поднять константу если маршрутизатор шлёт больше.
+fn ra_options(rest: &[u8]) -> RaFields {
+    let mut out = RaFields {
+        mtu: None,
+        prefixes: heapless::Vec::new(),
+        dns: heapless::Vec::new(),
+        domain: None,
+    };
+    if rest.len() < 8 {
+        return out;
+    }
+    let options = &rest[8..];
+    let mut i = 0;
+    while i + 2 <= options.len() {
+        let opt_type = options[i];
+        let units = options[i + 1] as usize;
+        if units == 0 {
+            break;
+        }
+        let opt_bytes = units * 8;
+        if i + opt_bytes > options.len() {
+            break;
+        }
+        let opt = &options[i..i + opt_bytes];
+        match opt_type {
+            common::ICMP6_NDP_OPT_PREFIX if out.prefixes.len() < common::RA_MAX_PREFIXES && units == 4 => {
+                if let Some(prefix) = ra_prefix(opt) {
+                    let _ = out.prefixes.push(prefix);
+                }
+            }
+            common::ICMP6_NDP_OPT_MTU if out.mtu.is_none() && units == 1 => {
+                out.mtu = Some(u32::from_be_bytes([opt[4], opt[5], opt[6], opt[7]]));
+            }
+            common::ICMP6_NDP_OPT_RDNSS if out.dns.len() < common::RA_MAX_DNS && units >= 3 && units % 2 == 1 => {
+                for chunk in opt[8..].chunks_exact(16) {
+                    if out.dns.len() == common::RA_MAX_DNS {
+                        break;
+                    }
+                    if let Some(ip) = ipv6_addr_from(chunk) {
+                        let _ = out.dns.push(ip);
+                    }
+                }
+            }
+            common::ICMP6_NDP_OPT_DNSSL if out.domain.is_none() && units >= 2 => {
+                out.domain = dnssl_name(&opt[8..]);
+            }
+            _ => {}
+        }
+        i += opt_bytes;
+    }
+    out
+}
+
+/// Prefix Information: длина опции 4, prefix length не больше 128. Флаги L/A и сроки не читаются.
+fn ra_prefix(opt: &[u8]) -> Option<common::RaPrefix> {
+    if opt.len() != 32 {
+        return None;
+    }
+    let len = opt[2];
+    if len > 128 {
+        return None;
+    }
+    Some(common::RaPrefix { len, prefix: ipv6_addr_from(&opt[16..])? })
+}
+
+/// Первое несжатое имя DNSSL. Указатель и обрезанная метка — имени нет.
+fn dnssl_name(names: &[u8]) -> Option<heapless::String<{ common::UDP_QNAME_MAX }>> {
+    if names.first().copied().unwrap_or(0) == 0 {
+        return None;
+    }
+    let mut out = heapless::String::new();
+    let mut pos = 0usize;
+    loop {
+        if pos >= names.len() {
+            return None;
+        }
+        let len = names[pos] as usize;
+        if len == 0 {
+            break;
+        }
+        if len > 63 {
+            return None;
+        }
+        let end = pos + 1 + len;
+        if end > names.len() {
+            return None;
+        }
+        push_dns_label(&mut out, &names[pos + 1..end]);
+        pos = end;
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
 /// MAC соседа из опций NDP после 16-байтного target (RFC 4861 §4.6).
 /// `want` — тип 1 для NS, тип 2 для NA. Берётся первая опция этого типа длиной 1
 /// (8 байт: заголовок и Ethernet MAC). Длиннее 6 байт — пропускается.
@@ -1209,12 +1526,13 @@ fn parse_icmp6_msg(
         Icmpv6Type::TimeExceeded(_) => Some(common::Icmp6Data::TimeExceeded { code: hdr.icmp_type.code_u8() }),
         Icmpv6Type::ParameterProblem(_) => Some(common::Icmp6Data::ParamProblem { code: hdr.icmp_type.code_u8() }),
         Icmpv6Type::RouterSolicitation => Some(common::Icmp6Data::RouterSolicitation),
-        Icmpv6Type::RouterAdvertisement(ra) => Some(common::Icmp6Data::RouterAdvertisement {
-            hop_limit: ra.cur_hop_limit,
-            managed: ra.managed_address_config,
-            other_config: ra.other_config,
-            lifetime: ra.router_lifetime,
-        }),
+        Icmpv6Type::RouterAdvertisement(ra) => Some(ra_message(
+            ra.cur_hop_limit,
+            ra.managed_address_config,
+            ra.other_config,
+            ra.router_lifetime,
+            rest,
+        )),
         Icmpv6Type::NeighborSolicitation => {
             let target = ipv6_addr_from(rest)?;
             let lladdr = ndp_neighbor_lladdr(&rest[16..], common::ICMP6_NDP_OPT_SRC_LLADDR);
@@ -1255,12 +1573,13 @@ fn parse_icmp6_msg(
             common::ICMP6_TYPE_MLDV2_REPORT => Some(common::Icmp6Data::MldV2Report),
             // etherparse 0.19 отдаёт RS/RA/Redirect как Unknown
             common::ICMP6_TYPE_RS => Some(common::Icmp6Data::RouterSolicitation),
-            common::ICMP6_TYPE_RA => Some(common::Icmp6Data::RouterAdvertisement {
-                hop_limit: bytes5to8[0],
-                managed: bytes5to8[1] & 0x80 != 0,
-                other_config: bytes5to8[1] & 0x40 != 0,
-                lifetime: u16::from_be_bytes([bytes5to8[2], bytes5to8[3]]),
-            }),
+            common::ICMP6_TYPE_RA => Some(ra_message(
+                bytes5to8[0],
+                bytes5to8[1] & 0x80 != 0,
+                bytes5to8[1] & 0x40 != 0,
+                u16::from_be_bytes([bytes5to8[2], bytes5to8[3]]),
+                rest,
+            )),
             common::ICMP6_TYPE_REDIRECT => {
                 let target = ipv6_addr_from(rest)?;
                 let destination = ipv6_addr_from(&rest[16..])?;
@@ -2448,7 +2767,7 @@ mod tests {
     fn udp_dhcp4_discover() {
         let data = ipv4_udp(68, 67, &dhcp4_with_options(&[53, 1, 1, 255]));
         match data.l4.clone() {
-            common::IpL4::Udp { app: common::UdpApp::Dhcp4, msg: Some(common::UdpMsg::Dhcp4 { msg: Some(common::Dhcp4Msg::Discover), host: None, requested: None }), .. } => {}
+            common::IpL4::Udp { app: common::UdpApp::Dhcp4, msg: Some(common::UdpMsg::Dhcp4 { msg: Some(common::Dhcp4Msg::Discover), host: None, requested: None, .. }), .. } => {}
             other => panic!("expected DHCP Discover, got {other:?}"),
         }
         assert!(format!("{}", data).contains("UDP/DHCP Discover"));
@@ -2469,7 +2788,7 @@ mod tests {
     fn udp_dhcp4_cookie_without_msg_type() {
         let data = ipv4_udp(67, 68, &dhcp4_with_options(&[]));
         match data.l4.clone() {
-            common::IpL4::Udp { app: common::UdpApp::Dhcp4, msg: Some(common::UdpMsg::Dhcp4 { msg: None, host: None, requested: None }), .. } => {}
+            common::IpL4::Udp { app: common::UdpApp::Dhcp4, msg: Some(common::UdpMsg::Dhcp4 { msg: None, host: None, requested: None, .. }), .. } => {}
             other => panic!("expected DHCP without type, got {other:?}"),
         }
     }
@@ -2482,7 +2801,7 @@ mod tests {
         ]));
         match data.l4.clone() {
             common::IpL4::Udp { msg: Some(common::UdpMsg::Dhcp4 {
-                msg: Some(common::Dhcp4Msg::Request), host: Some(name), requested: None,
+                msg: Some(common::Dhcp4Msg::Request), host: Some(name), requested: None, ..
             }), .. } => assert_eq!(name.as_str(), "host1"),
             other => panic!("expected DHCP Request, got {other:?}"),
         }
@@ -2499,7 +2818,7 @@ mod tests {
         ]));
         match data.l4.clone() {
             common::IpL4::Udp { msg: Some(common::UdpMsg::Dhcp4 {
-                msg: Some(common::Dhcp4Msg::Request), host: Some(name), requested: Some(ip),
+                msg: Some(common::Dhcp4Msg::Request), host: Some(name), requested: Some(ip), ..
             }), .. } => {
                 assert_eq!(name.as_str(), "printer");
                 assert_eq!(ip, common::Ipv4Addr::new(192, 168, 1, 50));
@@ -2555,12 +2874,68 @@ mod tests {
         }
     }
 
+    /// ACK: шлюз, DNS, сервер, срок аренды и домен читаются в том же проходе.
+    #[test]
+    fn udp_dhcp4_ack_gateway_dns_lease_domain() {
+        let data = ipv4_udp(67, 68, &dhcp4_with_options(&[
+            53, 1, 5,
+            3, 4, 192, 168, 1, 1,
+            6, 8, 8, 8, 8, 8, 1, 1, 1, 1,
+            54, 4, 192, 168, 1, 1,
+            51, 4, 0, 0, 0x01, 0x2c,
+            15, 3, b'l', b'a', b'n',
+            255,
+        ]));
+        match data.l4.clone() {
+            common::IpL4::Udp { msg: Some(common::UdpMsg::Dhcp4 {
+                msg: Some(common::Dhcp4Msg::Ack),
+                router: Some(gw),
+                dns,
+                server: Some(srv),
+                lease: Some(300),
+                domain: Some(name),
+                ..
+            }), .. } => {
+                assert_eq!(gw, common::Ipv4Addr::new(192, 168, 1, 1));
+                assert_eq!(dns.as_slice(), &[
+                    common::Ipv4Addr::new(8, 8, 8, 8),
+                    common::Ipv4Addr::new(1, 1, 1, 1),
+                ]);
+                assert_eq!(srv, common::Ipv4Addr::new(192, 168, 1, 1));
+                assert_eq!(name.as_str(), "lan");
+            }
+            other => panic!("expected DHCP Ack fields, got {other:?}"),
+        }
+        let shown = format!("{}", data);
+        assert!(shown.contains("router=192.168.1.1"));
+        assert!(shown.contains("dns=8.8.8.8,1.1.1.1"));
+        assert!(shown.contains("domain=lan"));
+        assert!(shown.contains("lease=300"));
+    }
+
+    /// DNS не кратный 4 пропускается. Шлюз из следующей опции сохраняется.
+    #[test]
+    fn udp_dhcp4_dns_wrong_length_skipped() {
+        let data = ipv4_udp(67, 68, &dhcp4_with_options(&[
+            6, 3, 8, 8, 8, 3, 4, 10, 0, 0, 1, 255,
+        ]));
+        match data.l4.clone() {
+            common::IpL4::Udp { msg: Some(common::UdpMsg::Dhcp4 {
+                router: Some(gw), dns, ..
+            }), .. } => {
+                assert!(dns.is_empty());
+                assert_eq!(gw, common::Ipv4Addr::new(10, 0, 0, 1));
+            }
+            other => panic!("expected gateway without DNS, got {other:?}"),
+        }
+    }
+
     /// DHCPv6 Solicit: 4 байта, тип в первом. В строке есть тип.
     #[test]
     fn udp_dhcp6_solicit() {
         let data = ipv4_udp(546, 547, &[1, 0x11, 0x22, 0x33]);
         match data.l4.clone() {
-            common::IpL4::Udp { app: common::UdpApp::Dhcp6, msg: Some(common::UdpMsg::Dhcp6 { msg: common::Dhcp6Msg::Solicit }), .. } => {}
+            common::IpL4::Udp { app: common::UdpApp::Dhcp6, msg: Some(common::UdpMsg::Dhcp6 { msg: common::Dhcp6Msg::Solicit, addr: None, .. }), .. } => {}
             other => panic!("expected DHCPv6 Solicit, got {other:?}"),
         }
         assert!(format!("{}", data).contains("UDP/DHCPv6 Solicit"));
@@ -2571,7 +2946,7 @@ mod tests {
     fn udp_dhcp6_reply() {
         let data = ipv4_udp(547, 546, &[7, 0, 0, 1]);
         match data.l4.clone() {
-            common::IpL4::Udp { msg: Some(common::UdpMsg::Dhcp6 { msg: common::Dhcp6Msg::Reply }), .. } => {}
+            common::IpL4::Udp { msg: Some(common::UdpMsg::Dhcp6 { msg: common::Dhcp6Msg::Reply, addr: None, .. }), .. } => {}
             other => panic!("expected DHCPv6 Reply, got {other:?}"),
         }
     }
@@ -2583,10 +2958,69 @@ mod tests {
         body.extend_from_slice(&[0u8; 32]);
         let data = ipv4_udp(547, 547, &body);
         match data.l4.clone() {
-            common::IpL4::Udp { msg: Some(common::UdpMsg::Dhcp6 { msg: common::Dhcp6Msg::RelayForw }), .. } => {}
+            common::IpL4::Udp { msg: Some(common::UdpMsg::Dhcp6 { msg: common::Dhcp6Msg::RelayForw, addr: None, dns, .. }), .. } => {
+                assert!(dns.is_empty());
+            }
             other => panic!("expected DHCPv6 Relay-forward, got {other:?}"),
         }
         assert!(format!("{}", data).contains("UDP/DHCPv6 Relay-forward"));
+    }
+
+    /// Reply: адрес из IAADDR внутри IA_NA и DNS опции 23.
+    #[test]
+    fn udp_dhcp6_reply_addr_and_dns() {
+        let addr = common::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let dns = common::Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888);
+        let mut iaaddr = [0u8; 24];
+        iaaddr[..16].copy_from_slice(&addr.octets());
+        let mut iana = vec![0u8; 12];
+        iana.extend(dhcp6_opt(5, &iaaddr));
+        let mut body = vec![7, 0, 0, 1];
+        body.extend(dhcp6_opt(3, &iana));
+        body.extend(dhcp6_opt(23, &dns.octets()));
+
+        let data = ipv4_udp(547, 546, &body);
+        match data.l4.clone() {
+            common::IpL4::Udp { msg: Some(common::UdpMsg::Dhcp6 {
+                msg: common::Dhcp6Msg::Reply, addr: Some(got), dns: servers, ..
+            }), .. } => {
+                assert_eq!(got, addr);
+                assert_eq!(servers.as_slice(), &[dns]);
+            }
+            other => panic!("expected DHCPv6 address and DNS, got {other:?}"),
+        }
+        let shown = format!("{}", data);
+        assert!(shown.contains("addr=2001:db8::1"));
+        assert!(shown.contains("dns=2001:4860:4860::8888"));
+    }
+
+    /// Обрезанный IA_NA не даёт адрес. DNS, прочитанный раньше, остаётся.
+    #[test]
+    fn udp_dhcp6_truncated_ia_na_keeps_dns() {
+        let dns = common::Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888);
+        let mut body = vec![7, 0, 0, 1];
+        body.extend(dhcp6_opt(23, &dns.octets()));
+        body.extend_from_slice(&3u16.to_be_bytes());
+        body.extend_from_slice(&40u16.to_be_bytes());
+        body.extend_from_slice(&[1, 2, 3, 4]);
+
+        let data = ipv4_udp(547, 546, &body);
+        match data.l4.clone() {
+            common::IpL4::Udp { msg: Some(common::UdpMsg::Dhcp6 {
+                msg: common::Dhcp6Msg::Reply, addr: None, dns: servers, ..
+            }), .. } => {
+                assert_eq!(servers.as_slice(), &[dns]);
+            }
+            other => panic!("expected DNS without address, got {other:?}"),
+        }
+    }
+
+    fn dhcp6_opt(code: u16, data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&code.to_be_bytes());
+        out.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        out.extend_from_slice(data);
+        out
     }
 
     /// Relay короче 34 байт снимает ярлык.
@@ -3176,6 +3610,118 @@ Location: http://192.168.0.2/desc.xml\r\n\
         }
     }
 
+    /// Адрес и текст объявления лежат в additional. Имя сервиса берётся из PTR.
+    #[test]
+    fn udp_mdns_additional_addr_and_txt() {
+        let mut body = vec![0u8; 12];
+        body[7] = 1;
+        body[11] = 3;
+        append_dns_name(&mut body, "_googlecast._tcp.local");
+        body.extend_from_slice(&[0, 12, 0, 1, 0, 0, 0, 0]);
+        let mut rdata = Vec::new();
+        append_dns_name(&mut rdata, "Living-Room._googlecast._tcp.local");
+        body.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        body.extend_from_slice(&rdata);
+
+        let host_at = body.len();
+        assert!(host_at < 256);
+        append_dns_name(&mut body, "living-room.local");
+        body.extend_from_slice(&[0, 1, 0x80, 0x01, 0, 0, 0, 120, 0, 4, 192, 168, 1, 50]);
+        body.extend_from_slice(&[0xC0, host_at as u8, 0, 28, 0x80, 0x01, 0, 0, 0, 120, 0, 16]);
+        body.extend_from_slice(&common::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 9).octets());
+        body.extend_from_slice(&[0xC0, host_at as u8, 0, 16, 0x80, 0x01, 0, 0, 0, 120]);
+        let txt = b"\x0efn=Living Room\x07md=Nest";
+        body.extend_from_slice(&(txt.len() as u16).to_be_bytes());
+        body.extend_from_slice(txt);
+
+        let data = ipv4_udp(5353, 5353, &body);
+        match data.l4.clone() {
+            common::IpL4::Udp { app: common::UdpApp::Mdns, msg: Some(common::UdpMsg::Query(q)), .. } => {
+                assert_eq!(q.ptr.unwrap().as_str(), "Living-Room._googlecast._tcp.local");
+                assert_eq!(q.service.unwrap().as_str(), "_googlecast._tcp");
+                assert_eq!(q.a.unwrap(), common::Ipv4Addr::new(192, 168, 1, 50));
+                assert_eq!(q.aaaa.unwrap(), common::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 9));
+                assert_eq!(q.txt.unwrap().as_str(), "fn=Living Room md=Nest");
+            }
+            other => panic!("expected mDNS address and txt, got {other:?}"),
+        }
+        let shown = format!("{}", data);
+        assert!(shown.contains("A=192.168.1.50"));
+        assert!(shown.contains("AAAA=2001:db8::9"));
+        assert!(shown.contains("TXT=fn=Living Room md=Nest"));
+    }
+
+    /// Ответ без вопроса, только A: ярлык mDNS и адрес остаются.
+    #[test]
+    fn udp_mdns_a_only() {
+        let mut body = vec![0u8; 12];
+        body[7] = 1;
+        append_dns_name(&mut body, "printer.local");
+        body.extend_from_slice(&[0, 1, 0x80, 0x01, 0, 0, 0, 0, 0, 4, 10, 1, 2, 3]);
+        let data = ipv4_udp(5353, 5353, &body);
+        match data.l4.clone() {
+            common::IpL4::Udp { app: common::UdpApp::Mdns, msg: Some(common::UdpMsg::Query(q)), .. } => {
+                assert!(q.name.is_none());
+                assert_eq!(q.a.unwrap(), common::Ipv4Addr::new(10, 1, 2, 3));
+                assert!(q.aaaa.is_none());
+                assert!(q.txt.is_none());
+            }
+            other => panic!("expected mDNS A only, got {other:?}"),
+        }
+    }
+
+    /// TXT с длиной строки за rdata пропускается. Следующий целый TXT читается.
+    #[test]
+    fn udp_mdns_broken_txt_skipped() {
+        let mut body = vec![0u8; 12];
+        body[7] = 2;
+        append_dns_name(&mut body, "printer.local");
+        body.extend_from_slice(&[0, 16, 0, 1, 0, 0, 0, 0, 0, 3, 5, b'a', b'b']);
+        body.extend_from_slice(&[0xC0, 12, 0, 16, 0, 1, 0, 0, 0, 0]);
+        let txt = b"\x05fn=ok";
+        body.extend_from_slice(&(txt.len() as u16).to_be_bytes());
+        body.extend_from_slice(txt);
+
+        let data = ipv4_udp(5353, 5353, &body);
+        match data.l4.clone() {
+            common::IpL4::Udp { msg: Some(common::UdpMsg::Query(q)), .. } => {
+                assert_eq!(q.txt.unwrap().as_str(), "fn=ok");
+            }
+            other => panic!("expected the next TXT, got {other:?}"),
+        }
+    }
+
+    /// DNS/53 не сохраняет A. Имя вопроса остаётся.
+    #[test]
+    fn udp_dns_does_not_keep_a() {
+        let mut body = dns_query("printer.local");
+        body[7] = 1;
+        body.extend_from_slice(&[0xC0, 12, 0, 1, 0, 1, 0, 0, 0, 0, 0, 4, 10, 0, 0, 2]);
+        let data = ipv4_udp(53, 53, &body);
+        match data.l4.clone() {
+            common::IpL4::Udp { app: common::UdpApp::Dns, msg: Some(common::UdpMsg::Query(q)), .. } => {
+                assert_eq!(q.name.unwrap().as_str(), "printer.local");
+                assert!(q.a.is_none());
+                assert!(q.txt.is_none());
+            }
+            other => panic!("expected DNS without address, got {other:?}"),
+        }
+    }
+
+    /// Ответ только с A на порту 53 не подтверждает тело.
+    #[test]
+    fn udp_dns_a_only_has_no_msg() {
+        let mut body = vec![0u8; 12];
+        body[7] = 1;
+        append_dns_name(&mut body, "printer.local");
+        body.extend_from_slice(&[0, 1, 0, 1, 0, 0, 0, 0, 0, 4, 10, 0, 0, 2]);
+        let data = ipv4_udp(53, 53, &body);
+        match data.l4.clone() {
+            common::IpL4::Udp { app: common::UdpApp::Dns, msg: None, .. } => {}
+            other => panic!("expected DNS without message, got {other:?}"),
+        }
+    }
+
     /// Неизвестный порт остаётся Other, Display без суффикса приложения.
     #[test]
     fn udp_other_keeps_plain_udp() {
@@ -3320,14 +3866,110 @@ Location: http://192.168.0.2/desc.xml\r\n\
         let hdr = etherparse::Icmpv6Header::new(etherparse::Icmpv6Type::RouterAdvertisement(ra));
         let data = expect_ip(ipv6_l4(etherparse::IpNumber::IPV6_ICMP, &hdr.to_bytes()));
         match data.l4.clone() {
-            common::IpL4::Icmp6(common::Icmp6Data::RouterAdvertisement { hop_limit, managed, other_config, lifetime }) => {
+            common::IpL4::Icmp6(common::Icmp6Data::RouterAdvertisement {
+                hop_limit, managed, other_config, lifetime, mtu, prefixes, dns, domain,
+            }) => {
                 assert_eq!(hop_limit, 64);
                 assert!(managed);
                 assert!(!other_config);
                 assert_eq!(lifetime, 1800);
+                assert!(mtu.is_none());
+                assert!(prefixes.is_empty());
+                assert!(dns.is_empty());
+                assert!(domain.is_none());
             }
             other => panic!("expected RA, got {other:?}"),
         }
+    }
+
+    /// RA: префикс, два DNS, домен и MTU. Опция префикса неверной длины пропускается.
+    #[test]
+    fn ipv6_icmp_ra_prefix_dns_domain_mtu() {
+        let prefix = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let dns1 = [0x20, 0x01, 0x48, 0x60, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0x88, 0x88];
+        let dns2 = [0x20, 0x01, 0x48, 0x60, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0x88, 0x44];
+        let mut opts = vec![common::ICMP6_NDP_OPT_PREFIX, 1, 64, 0, 0, 0, 0, 0];
+        opts.extend(ra_prefix_opt(64, prefix));
+        opts.extend(ra_rdnss(&[dns1, dns2]));
+        opts.extend(ra_dnssl_lan());
+        opts.extend_from_slice(&ra_mtu_opt(1500));
+
+        let data = expect_ip(ipv6_l4(etherparse::IpNumber::IPV6_ICMP, &ra_icmp(&opts)));
+        match data.l4.clone() {
+            common::IpL4::Icmp6(common::Icmp6Data::RouterAdvertisement {
+                prefixes, dns, domain, mtu, ..
+            }) => {
+                assert_eq!(prefixes.len(), 1);
+                assert_eq!(prefixes[0].len, 64);
+                assert_eq!(prefixes[0].prefix, common::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0));
+                assert_eq!(dns.as_slice(), &[
+                    common::Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888),
+                    common::Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8844),
+                ]);
+                assert_eq!(domain.unwrap().as_str(), "lan");
+                assert_eq!(mtu, Some(1500));
+            }
+            other => panic!("expected RA options, got {other:?}"),
+        }
+        let shown = format!("{}", data);
+        assert!(shown.contains("prefix=2001:db8::/64"));
+        assert!(shown.contains("dns=2001:4860:4860::8888,2001:4860:4860::8844"));
+        assert!(shown.contains("domain=lan"));
+        assert!(shown.contains("mtu=1500"));
+    }
+
+    /// Префикс сохраняется. Опция, заявленная длиннее хвоста, не даёт DNS.
+    #[test]
+    fn ipv6_icmp_ra_truncated_option_keeps_prefix() {
+        let prefix = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let mut opts = ra_prefix_opt(64, prefix);
+        opts.extend_from_slice(&[common::ICMP6_NDP_OPT_RDNSS, 5, 0, 0]);
+        let data = expect_ip(ipv6_l4(etherparse::IpNumber::IPV6_ICMP, &ra_icmp(&opts)));
+        match data.l4.clone() {
+            common::IpL4::Icmp6(common::Icmp6Data::RouterAdvertisement { prefixes, dns, .. }) => {
+                assert_eq!(prefixes.len(), 1);
+                assert!(dns.is_empty());
+            }
+            other => panic!("expected prefix without DNS, got {other:?}"),
+        }
+    }
+
+    fn ra_icmp(options: &[u8]) -> Vec<u8> {
+        let mut icmp = vec![
+            common::ICMP6_TYPE_RA, 0, 0, 0,
+            64, 0, 0x07, 0x08,
+            0, 0, 0, 0,
+            0, 0, 0, 0,
+        ];
+        icmp.extend_from_slice(options);
+        icmp
+    }
+
+    fn ra_prefix_opt(len: u8, prefix: [u8; 16]) -> Vec<u8> {
+        let mut opt = vec![common::ICMP6_NDP_OPT_PREFIX, 4, len, 0xc0];
+        opt.extend_from_slice(&[0; 12]);
+        opt.extend_from_slice(&prefix);
+        opt
+    }
+
+    fn ra_rdnss(addrs: &[[u8; 16]]) -> Vec<u8> {
+        let mut opt = vec![common::ICMP6_NDP_OPT_RDNSS, (1 + 2 * addrs.len()) as u8, 0, 0, 0, 0, 0, 0];
+        for addr in addrs {
+            opt.extend_from_slice(addr);
+        }
+        opt
+    }
+
+    fn ra_dnssl_lan() -> Vec<u8> {
+        vec![
+            common::ICMP6_NDP_OPT_DNSSL, 2, 0, 0, 0, 0, 0, 0,
+            3, b'l', b'a', b'n', 0, 0, 0, 0,
+        ]
+    }
+
+    fn ra_mtu_opt(mtu: u32) -> [u8; 8] {
+        let b = mtu.to_be_bytes();
+        [common::ICMP6_NDP_OPT_MTU, 1, 0, 0, b[0], b[1], b[2], b[3]]
     }
 
     /// MLD Query: тип 130, группа в хвосте.

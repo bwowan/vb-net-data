@@ -1,39 +1,54 @@
 {
-    // Use IntelliSense to learn about possible attributes.
-    // Hover to view descriptions of possible attributes.
-    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
     "version": "0.2.0",
     "configurations": [
+        {
+            "name": "Debug executable 'net_visualizator'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin=net_visualizator",
+                    "--package=net_visualizator"
+                ],
+                "filter": {
+                    "name": "net_visualizator",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "sourceLanguages": ["rust"]
+        },
         {
             "name": "Debug executable 'net_listener'",
             "type": "lldb",
             "request": "launch",
             "cargo": {
                 "args": [
-                    "run",
+                    "build",
                     "--bin=net_listener",
                     "--package=net_listener"
                 ],
-                "cwd": "${workspaceFolder}"
+                "filter": {
+                    "name": "net_listener",
+                    "kind": "bin"
+                }
             },
             "args": [],
             "cwd": "${workspaceFolder}",
             "sourceLanguages": ["rust"],
-            "stopOnEntry": false,
-            "console": "debugConsole",
             "preLaunchTask": "Build-net_listener-setCap"
-        }
+        },
         {
             "name": "Debug executable 'net_listener' (built binary)",
             "type": "lldb",
             "request": "launch",
-            "program": "${workspaceFolder}/target/debug/net_listener",
+            "program": "/tmpu/NetData/debug/net_listener",
             "args": [],
             "cwd": "${workspaceFolder}",
             "sourceLanguages": ["rust"],
-            "stopOnEntry": false,
-            "console": "debugConsole",
-            "preLaunchTask": "Build net_listener"
+            "preLaunchTask": "Build-net_listener-setCap"
         },
         {
             "name": "Debug unit tests in library 'common'",
@@ -42,10 +57,16 @@
             "cargo": {
                 "args": [
                     "test",
+                    "--no-run",
                     "--package=common"
                 ],
-                "cwd": "${workspaceFolder}"
-            }
+                "filter": {
+                    "name": "common",
+                    "kind": "lib"
+                }
+            },
+            "cwd": "${workspaceFolder}",
+            "sourceLanguages": ["rust"]
         },
         {
             "name": "Debug unit tests in executable 'net_listener'",
@@ -54,29 +75,17 @@
             "cargo": {
                 "args": [
                     "test",
+                    "--no-run",
                     "--bin=net_listener",
                     "--package=net_listener"
                 ],
-                "cwd": "${workspaceFolder}"
-            }
-        },
-        {
-            "name": "Debug executable 'net_visualizator'",
-            "type": "lldb",
-            "request": "launch",
-            "cargo": {
-                "args": [
-                    "run",
-                    "--bin=net_visualizator",
-                    "--package=net_visualizator"
-                ],
-                "cwd": "${workspaceFolder}"
+                "filter": {
+                    "name": "net_listener",
+                    "kind": "bin"
+                }
             },
-            "args": [],
             "cwd": "${workspaceFolder}",
-            "sourceLanguages": ["rust"],
-            "stopOnEntry": false,
-            "console": "debugConsole"
+            "sourceLanguages": ["rust"]
         },
         {
             "name": "Debug unit tests in executable 'net_visualizator'",
@@ -85,11 +94,17 @@
             "cargo": {
                 "args": [
                     "test",
+                    "--no-run",
                     "--bin=net_visualizator",
                     "--package=net_visualizator"
                 ],
-                "cwd": "${workspaceFolder}"
-            }
+                "filter": {
+                    "name": "net_visualizator",
+                    "kind": "bin"
+                }
+            },
+            "cwd": "${workspaceFolder}",
+            "sourceLanguages": ["rust"]
         }
     ]
 }

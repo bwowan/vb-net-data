@@ -308,6 +308,15 @@ pub const NBNS_NAME_MAX: usize = 15;
 /// Сколько символов строки SSDP сохраняем. Хвост длиннее обрезается, пакет остаётся SSDP.
 pub const UDP_SSDP_MAX: usize = 128;
 
+/// Сколько символов текста mDNS TXT сохраняем. Хвост длиннее обрезается.
+pub const UDP_TXT_MAX: usize = 128;
+
+/// Сколько адресов DNS из опции 6 DHCP сохраняем.
+pub const DHCP4_MAX_DNS: usize = 4;
+
+/// Сколько адресов DNS из опции 23 DHCPv6 сохраняем.
+pub const DHCP6_MAX_DNS: usize = 4;
+
 /// Тип сообщения DHCP (опция 53, RFC 2132).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Dhcp4Msg {
@@ -381,29 +390,44 @@ pub struct NbnsMsg {
 /// DNS, mDNS или LLMNR.
 /// `name` — первое имя вопроса, если вопросы есть.
 /// `srv` — порт и хост первой записи SRV в ответах.
-/// `service` и `ptr` заполняются только у mDNS: две метки `_service._proto` и имя первой PTR.
+/// `service`, `ptr`, `a`, `aaaa` и `txt` заполняются только у mDNS.
+/// `a` / `aaaa` — первая запись A или AAAA. `txt` — первый TXT, не длиннее `UDP_TXT_MAX`.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct DnsQuery {
     pub name: Option<heapless::String<UDP_QNAME_MAX>>,
     pub srv: Option<SrvHost>,
     pub service: Option<heapless::String<UDP_QNAME_MAX>>,
     pub ptr: Option<heapless::String<UDP_QNAME_MAX>>,
+    pub a: Option<Ipv4Addr>,
+    pub aaaa: Option<Ipv6Addr>,
+    pub txt: Option<heapless::String<UDP_TXT_MAX>>,
 }
 
 /// Что удалось прочитать из тела UDP. Ярлык `UdpApp` при этом уже подтверждён.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum UdpMsg {
     /// Имя вопроса и, если в ответах есть SRV, её порт и хост.
-    /// У mDNS ещё `service` (`_service._proto`) и имя первой PTR.
+    /// У mDNS ещё `service`, имя PTR, первые A/AAAA и TXT.
     Query(DnsQuery),
     /// DHCPv6: первый байт — известный тип, длина заголовка достаточная.
-    Dhcp6 { msg: Dhcp6Msg },
+    /// `addr` — первый IAADDR внутри IA_NA. `dns` — опция 23. У relay оба пустые.
+    Dhcp6 {
+        msg: Dhcp6Msg,
+        addr: Option<Ipv6Addr>,
+        dns: heapless::Vec<Ipv6Addr, DHCP6_MAX_DNS>,
+    },
     /// DHCP: magic cookie совпал.
-    /// `msg` — опция 53, `host` — опция 12 (не длиннее `UDP_QNAME_MAX`), `requested` — опция 50.
+    /// `msg` — опция 53, `host` — опция 12, `requested` — опция 50.
+    /// `router` — первый адрес опции 3, `dns` — опция 6, `server` — 54, `lease` — 51, `domain` — 15.
     Dhcp4 {
         msg: Option<Dhcp4Msg>,
         host: Option<heapless::String<UDP_QNAME_MAX>>,
         requested: Option<Ipv4Addr>,
+        router: Option<Ipv4Addr>,
+        dns: heapless::Vec<Ipv4Addr, DHCP4_MAX_DNS>,
+        server: Option<Ipv4Addr>,
+        lease: Option<u32>,
+        domain: Option<heapless::String<UDP_QNAME_MAX>>,
     },
     /// SSDP: первая строка и заголовки NT, USN, LOCATION.
     Ssdp(SsdpMsg),
@@ -485,6 +509,22 @@ pub const ICMP6_TYPE_MLDV2_REPORT:   u8 = 143;
 pub const ICMP6_NDP_TARGET_LEN: usize = 16;
 pub const ICMP6_NDP_OPT_SRC_LLADDR: u8 = 1; // Source Link-Layer Address: MAC спрашивающего в NS
 pub const ICMP6_NDP_OPT_TGT_LLADDR: u8 = 2; // Target Link-Layer Address: MAC объявляемого соседа в NA
+pub const ICMP6_NDP_OPT_PREFIX: u8 = 3;     // Prefix Information (RFC 4861)
+pub const ICMP6_NDP_OPT_MTU: u8 = 5;        // MTU (RFC 4861)
+pub const ICMP6_NDP_OPT_RDNSS: u8 = 25;     // Recursive DNS Server (RFC 8106)
+pub const ICMP6_NDP_OPT_DNSSL: u8 = 31;     // DNS Search List (RFC 8106)
+
+/// Сколько префиксов RA сохраняем. У домашнего маршрутизатора обычно один или два.
+pub const RA_MAX_PREFIXES: usize = 4;
+/// Сколько адресов RDNSS сохраняем.
+pub const RA_MAX_DNS: usize = 4;
+
+/// Префикс из опции NDP Prefix Information. Сроки и флаги L/A не сохраняются.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct RaPrefix {
+    pub len: u8,
+    pub prefix: Ipv6Addr,
+}
 pub const ICMP6_MLD_MIN_LEN:    usize = 24; // type..reserved + 16-byte group
 pub const ICMP6_REDIRECT_MIN:   usize = 8 + 16 + 16;
 
@@ -510,8 +550,9 @@ pub enum Icmp6Type {
 }
 
 /// Разобранное ICMPv6-сообщение.
-/// У NS читается Source LLA (тип 1), у NA — Target LLA (тип 2). Остальные NDP options и записи MLDv2 не разбираются.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+/// У NS читается Source LLA (тип 1), у NA — Target LLA (тип 2).
+/// У RA — префикс, RDNSS, первый домен DNSSL и MTU. Остальные NDP options и записи MLDv2 не разбираются.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Icmp6Data {
     EchoRequest { id: u16, seq: u16 },
     EchoReply   { id: u16, seq: u16 },
@@ -520,7 +561,16 @@ pub enum Icmp6Data {
     TimeExceeded { code: u8 },
     ParamProblem { code: u8 },
     RouterSolicitation,
-    RouterAdvertisement { hop_limit: u8, managed: bool, other_config: bool, lifetime: u16 },
+    RouterAdvertisement {
+        hop_limit: u8,
+        managed: bool,
+        other_config: bool,
+        lifetime: u16,
+        mtu: Option<u32>,
+        prefixes: heapless::Vec<RaPrefix, RA_MAX_PREFIXES>,
+        dns: heapless::Vec<Ipv6Addr, RA_MAX_DNS>,
+        domain: Option<heapless::String<UDP_QNAME_MAX>>,
+    },
     NeighborSolicitation { target: Ipv6Addr, lladdr: Option<MacAddr6> },
     NeighborAdvertisement { router: bool, solicited: bool, override_flag: bool, target: Ipv6Addr, lladdr: Option<MacAddr6> },
     Redirect { target: Ipv6Addr, destination: Ipv6Addr },

@@ -1,0 +1,17 @@
+---
+description: Структуры разобранного кадра в крейте common
+globs: "**/*.rs"
+alwaysApply: false
+---
+
+# Структуры кадра (common)
+
+* `net_common.rs` — типы. `impls.rs` — конструкторы. `display.rs` — `Display`. `net_serde.rs` — кадр IPC.
+* `NetData` — это `EthData` и `NetPayload`. Транспорт IP лежит в `IpData.l4: IpL4`, не в `NetPayload`.
+* Ошибка разбора — вариант `ParseError` (длина, адреса) внутри `NetPayload::Err`.
+* Списки и строки фиксированной ёмкости: `heapless::Vec` / `heapless::String`.
+* На типах внутри `NetData` стоят `Serialize` и `Deserialize`. `Copy` — только без `heapless`. `IpData` не `Copy`.
+* Новое поле `NetData` укладывается в `SER_MAX_FRAME_LEN`. Иначе правится константа и тест `cdp_full_is_max_frame`.
+* `#[repr(C, packed)]` только у заголовка на проводе (`CISCO_CDP_HEADER`).
+* Имя из стандарта можно оставить как есть (`TLV_DATA`, `CDP_CISCO_DATA`).
+* Комментарий к полю — по-русски, что хранится. Ссылка на RFC — по-английски.

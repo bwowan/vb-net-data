@@ -304,6 +304,9 @@ mod tests {
                         srv: Some(SrvHost { port: 7000, host: hs("living-room.local") }),
                         service: Some(hs("_airplay._tcp")),
                         ptr: Some(hs("Living Room._airplay._tcp.local")),
+                        a: Some(Ipv4Addr::new(192, 168, 1, 20)),
+                        aaaa: Some(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)),
+                        txt: Some(hs("fn=Living Room")),
                     })),
                 },
                 312,
@@ -336,6 +339,11 @@ mod tests {
                         msg: Some(Dhcp4Msg::Request),
                         host: Some(hs("laptop-01")),
                         requested: Some(Ipv4Addr::new(192, 168, 1, 77)),
+                        router: Some(Ipv4Addr::new(192, 168, 1, 1)),
+                        dns: heapless::Vec::from_slice(&[Ipv4Addr::new(1, 1, 1, 1)]).unwrap(),
+                        server: Some(Ipv4Addr::new(192, 168, 1, 1)),
+                        lease: Some(3600),
+                        domain: Some(hs("lan")),
                     }),
                 },
                 300,
@@ -393,7 +401,7 @@ mod tests {
         roundtrip(&data);
     }
 
-    /// DHCPv6 Solicit.
+    /// DHCPv6 Reply с адресом IA_NA и DNS.
     #[test]
     fn roundtrip_udp_dhcp6() {
         let data = NetData {
@@ -403,9 +411,39 @@ mod tests {
                     src_port: 546,
                     dst_port: 547,
                     app: UdpApp::Dhcp6,
-                    msg: Some(UdpMsg::Dhcp6 { msg: Dhcp6Msg::Solicit }),
+                    msg: Some(UdpMsg::Dhcp6 {
+                        msg: Dhcp6Msg::Reply,
+                        addr: Some(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+                        dns: heapless::Vec::from_slice(&[Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888)]).unwrap(),
+                    }),
                 },
                 96,
+            ),
+        };
+        roundtrip(&data);
+    }
+
+    /// ICMPv6 Router Advertisement с префиксом, DNS, доменом и MTU.
+    #[test]
+    fn roundtrip_icmp6_ra() {
+        let mut prefixes = heapless::Vec::new();
+        push(&mut prefixes, RaPrefix { len: 64, prefix: Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0) });
+        let mut dns = heapless::Vec::new();
+        push(&mut dns, Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888));
+        let data = NetData {
+            eth: eth(EthType::Ipv6),
+            payload: ip6(
+                IpL4::Icmp6(Icmp6Data::RouterAdvertisement {
+                    hop_limit: 64,
+                    managed: false,
+                    other_config: true,
+                    lifetime: 1800,
+                    mtu: Some(1500),
+                    prefixes,
+                    dns,
+                    domain: Some(hs("lan")),
+                }),
+                128,
             ),
         };
         roundtrip(&data);

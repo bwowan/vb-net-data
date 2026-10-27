@@ -177,6 +177,20 @@ impl fmt::Display for NbnsMsg {
     }
 }
 
+fn write_addr_list<T: fmt::Display>(f: &mut fmt::Formatter<'_>, label: &str, addrs: &[T]) -> fmt::Result {
+    if addrs.is_empty() {
+        return Ok(());
+    }
+    write!(f, " {}=", label)?;
+    for (i, addr) in addrs.iter().enumerate() {
+        if i > 0 {
+            write!(f, ",")?;
+        }
+        write!(f, "{}", addr)?;
+    }
+    Ok(())
+}
+
 impl fmt::Display for DnsQuery {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut wrote = false;
@@ -203,6 +217,27 @@ impl fmt::Display for DnsQuery {
                 write!(f, " ")?;
             }
             write!(f, "SRV port={} host={}", srv.port, srv.host)?;
+            wrote = true;
+        }
+        if let Some(a) = self.a {
+            if wrote {
+                write!(f, " ")?;
+            }
+            write!(f, "A={}", a)?;
+            wrote = true;
+        }
+        if let Some(aaaa) = self.aaaa {
+            if wrote {
+                write!(f, " ")?;
+            }
+            write!(f, "AAAA={}", aaaa)?;
+            wrote = true;
+        }
+        if let Some(txt) = &self.txt {
+            if wrote {
+                write!(f, " ")?;
+            }
+            write!(f, "TXT={}", txt)?;
         }
         Ok(())
     }
@@ -303,9 +338,20 @@ impl fmt::Display for Icmp6Data {
             Icmp6Data::TimeExceeded { code }   => write!(f, "Time Exceeded code={}", code),
             Icmp6Data::ParamProblem { code }   => write!(f, "Param Problem code={}", code),
             Icmp6Data::RouterSolicitation     => write!(f, "Router Solicitation"),
-            Icmp6Data::RouterAdvertisement { hop_limit, managed, other_config, lifetime } => write!(
-                f, "Router Advertisement hop={} M={} O={} lifetime={}", hop_limit, managed, other_config, lifetime
-            ),
+            Icmp6Data::RouterAdvertisement { hop_limit, managed, other_config, lifetime, mtu, prefixes, dns, domain } => {
+                write!(f, "Router Advertisement hop={} M={} O={} lifetime={}", hop_limit, managed, other_config, lifetime)?;
+                for p in prefixes {
+                    write!(f, " prefix={}/{}", p.prefix, p.len)?;
+                }
+                write_addr_list(f, "dns", dns)?;
+                if let Some(domain) = domain {
+                    write!(f, " domain={}", domain)?;
+                }
+                if let Some(mtu) = mtu {
+                    write!(f, " mtu={}", mtu)?;
+                }
+                Ok(())
+            }
             Icmp6Data::NeighborSolicitation { target, lladdr } => match lladdr {
                 Some(mac) => write!(f, "Neighbor Solicitation target={} lladdr={}", target, mac),
                 None => write!(f, "Neighbor Solicitation target={}", target),
@@ -438,7 +484,7 @@ impl fmt::Display for IpData {
                     f, "IP[UDP/{} {}({}bytes), src:{}:{} --> dst:{}:{}]",
                     app, q, self.len, self.src, src_port, self.dst, dst_port
                 ),
-                Some(UdpMsg::Dhcp4 { msg, host, requested }) => {
+                Some(UdpMsg::Dhcp4 { msg, host, requested, router, dns, server, lease, domain }) => {
                     write!(f, "IP[UDP/{}", app)?;
                     if let Some(m) = msg {
                         write!(f, " {}", m)?;
@@ -449,6 +495,19 @@ impl fmt::Display for IpData {
                     if let Some(ip) = requested {
                         write!(f, " req={}", ip)?;
                     }
+                    if let Some(ip) = router {
+                        write!(f, " router={}", ip)?;
+                    }
+                    write_addr_list(f, "dns", dns)?;
+                    if let Some(ip) = server {
+                        write!(f, " server={}", ip)?;
+                    }
+                    if let Some(sec) = lease {
+                        write!(f, " lease={}", sec)?;
+                    }
+                    if let Some(name) = domain {
+                        write!(f, " domain={}", name)?;
+                    }
                     write!(
                         f, "({}bytes), src:{}:{} --> dst:{}:{}",
                         self.len, self.src, src_port, self.dst, dst_port
@@ -458,10 +517,17 @@ impl fmt::Display for IpData {
                     f, "IP[UDP/{} {}({}bytes), src:{}:{} --> dst:{}:{}]",
                     app, n, self.len, self.src, src_port, self.dst, dst_port
                 ),
-                Some(UdpMsg::Dhcp6 { msg }) => write!(
-                    f, "IP[UDP/{} {}({}bytes), src:{}:{} --> dst:{}:{}]",
-                    app, msg, self.len, self.src, src_port, self.dst, dst_port
-                ),
+                Some(UdpMsg::Dhcp6 { msg, addr, dns }) => {
+                    write!(f, "IP[UDP/{} {}", app, msg)?;
+                    if let Some(ip) = addr {
+                        write!(f, " addr={}", ip)?;
+                    }
+                    write_addr_list(f, "dns", dns)?;
+                    write!(
+                        f, "({}bytes), src:{}:{} --> dst:{}:{}",
+                        self.len, self.src, src_port, self.dst, dst_port
+                    )
+                }
                 Some(UdpMsg::Ssdp(s)) => {
                     write!(f, "IP[UDP/{} {}", app, s.start)?;
                     if let Some(nt) = &s.nt {

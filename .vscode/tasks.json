@@ -2,37 +2,36 @@
     "version": "2.0.0",
     "tasks": [
         {
+            "label": "cargo: build net_listener",
+            "type": "shell",
+            "command": "cargo build --bin net_listener --package net_listener",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": ["$rustc"],
+            "group": "build"
+        },
+        {
+            "label": "setcap net_listener",
+            "type": "shell",
+            "command": "sudo setcap cap_net_raw,cap_net_admin=eip /tmpu/NetData/debug/net_listener",
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "silent",
+                "echo": true
+            }
+        },
+        {
             "label": "Build-net_listener-setCap",
-            "type": "cargo",
-            "dependsOn": ["build", "setcap"],
-            "args": [
-                "--bin=net_listener",
-                "--package=net_listener"
+            "dependsOrder": "sequence",
+            "dependsOn": [
+                "cargo: build net_listener",
+                "setcap net_listener"
             ],
-            "problemMatcher": [
-                "$rustc"
-            ],
+            "problemMatcher": [],
             "group": {
                 "kind": "build",
                 "isDefault": true
-            }
-        }
-        {
-            "label": "setcap",
-            "type": "shell",
-            "command": "sudo setcap cap_net_raw+ep ${workspaceFolder}/target/debug/net_listener",
-            "presentation": {
-                "reveal": "silent",
-                "echo": false
-            }
-        }
-        {
-            "label": "sudo-cargo-run",
-            "type": "shell",
-            "command": "sudo ${workspaceFolder}/target/debug/net_listener",
-            "problemMatcher": [],
-            "presentation": {
-                "reveal": "never"
             }
         }
     ]

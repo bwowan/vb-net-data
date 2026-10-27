@@ -1,9 +1,29 @@
 # net_listener — продолжение сессии
 
-Репозиторий: `/mnt/DevData/Rust/NetData` (workspace — этот каталог). Типы — в `../common`.
+Репозиторий: `/mnt/DevData/Rust/NetData`. Типы — в `../common`. Не коммитить `*.heapsnapshot`.
 
-Последний коммит `3fcf223` (`improve protocol parsing. add tests.`) уже на `origin/main`. После него **не закоммичены**: обрезка IP-payload, IPv6 extensions, фрагменты, IGMP, классификация UDP, ICMPv6, ESP (SPI), типы ICMPv4, комментарии к типам, hex-дамп ошибочного Ethernet-кадра. Не коммитить `*.heapsnapshot`.
+## Конвейер
 
+```
+capture::run (поток ОС, pcap)
+  → flume::bounded<PoolSlot<NetData>>
+  → parser::run × N (tokio)
+  → broadcast<PoolSlot<NetData>>
+      → console::run    (поток ОС, ratatui)
+      → ipc_sender::run (поток ОС, Unix datagram)
+```
+
+N = `cores / 3`, либо 1, если ядер меньше 4. Слоты берёт `MemPool<NetData, 1024>`. Сырой кадр в слоте обрезается до `PACKET_BUF_KEEP` (4096). Канал захвата — половина пула. Полный канал или пустой пул — кадр теряется, захват не блокируется. `statistic.rs` не запускается.
+
+Сокет: `/tmpu/net_listener_stats2.sock`. Кадры идут после первой датаграммы от получателя. Лог: `/tmpu/net_listener.log`.
+
+Сборка пишет в `/tmpu/NetData` (`.cargo/config.toml`).
+
+```bash
+cargo build --bin net_listener
+sudo setcap cap_net_raw,cap_net_admin=eip /tmpu/NetData/debug/net_listener
+/tmpu/NetData/debug/net_listener
+```
 
 ## Контракт разбора
 
@@ -22,10 +42,12 @@
 
 `IpData` больше не `Copy`. Транспорт — одно поле `l4: IpL4` (адреса и `len` снаружи). Порты только у `Tcp` и `Udp`.
 
+Новое поле в `NetData` должно уложиться в `common::net_serde::SER_MAX_FRAME_LEN` (тест `cdp_full_is_max_frame`).
+
 - `Udp.app` — ярлык по порту **с любой стороны**. Специфичный важнее: DHCP/mDNS/SSDP, затем DNS/LLMNR/NTP, затем QUIC/WireGuard/ESP-UDP (`4500`), иначе `Other`.
-- `Udp.msg` — подтверждение тела. DNS/mDNS/LLMNR: первое имя вопроса (сжатие указателями, не длиннее 64 символов); вопросов нет — ярлык остаётся без имени. Первая SRV в ответах: порт и целевой хост; приоритет и вес не читаются. SRV короче 7 байт или с именем вне rdata пропускается, обрезанный ответ не даёт порт. mDNS ещё хранит метки `_service._proto` (вопрос, затем владелец PTR, rdata PTR, владелец SRV) и имя первой PTR. PTR с именем вне rdata пропускается. У DNS и LLMNR `service` и `ptr` пустые. DHCP: magic cookie `63825363`. Опция 53 — тип, опция 12 — hostname (не длиннее 64, непечатное становится `?`), опция 50 — запрошенный адрес (ровно 4 байта). SSDP: первая строка `M-SEARCH`, `NOTIFY` или `HTTP/1.x`; заголовки `NT`, `USN`, `LOCATION` (не длиннее 128, пробел сохраняется, прочее непечатное — `?`). Cookie нет, имя DNS битое или тело не SSDP — ярлык снимается. DHCPv6: первый байт — тип 1–13. Типы 1–11 не короче 4 байт, relay 12–13 не короче 34. Иначе ярлык снимается. Transaction-id и опции не читаются. NBNS (UDP 137): первая метка — 32 символа `A`–`P`. Имя (15 байт без хвостовых пробелов), суффикс, NB или NBSTAT, код операции. Ответ: код результата и IPv4 первой целой NB-записи (6 байт). Иначе ярлык снимается. Запрос и ответ не связываются. QUIC и WireGuard по-прежнему только по порту.
+- `Udp.msg` — подтверждение тела. DNS/mDNS/LLMNR: первое имя вопроса (сжатие указателями, не длиннее 64 символов); вопросов нет — ярлык остаётся без имени. Первая SRV: порт и целевой хост; приоритет и вес не читаются. SRV короче 7 байт или с именем вне rdata пропускается, обрезанный ответ не даёт порт. Записи ищутся в answer, authority и additional; обрыв секции дальше не идёт. mDNS ещё хранит метки `_service._proto` (вопрос, затем владелец PTR, rdata PTR, владелец SRV), имя первой PTR, первую A, первую AAAA и первый TXT (строки через пробел, не длиннее 128). Адрес не сверяется с хостом SRV. PTR с именем вне rdata и TXT с длиной строки за rdata пропускаются. У DNS и LLMNR `service`, `ptr`, `a`, `aaaa` и `txt` пустые; если после этого нечего сохранить, `msg` нет. DHCP: magic cookie `63825363`. Опция 53 — тип, опция 12 — hostname и опция 15 — домен (не длиннее 64, непечатное становится `?`), опция 50 — запрошенный адрес (ровно 4 байта), опция 3 — первый шлюз, опция 6 — до 4 DNS, опция 54 — сервер, опция 51 — срок аренды. Список не кратный 4 пропускается. `yiaddr` не читается. SSDP: первая строка `M-SEARCH`, `NOTIFY` или `HTTP/1.x`; заголовки `NT`, `USN`, `LOCATION` (не длиннее 128, пробел сохраняется, прочее непечатное — `?`). Cookie нет, имя DNS битое или тело не SSDP — ярлык снимается. DHCPv6: первый байт — тип 1–13. Типы 1–11 не короче 4 байт, relay 12–13 не короче 34. Иначе ярлык снимается. У не-relay: первый IAADDR внутри IA_NA и до 4 DNS (опция 23). Relay остаётся только типом. NBNS (UDP 137): первая метка — 32 символа `A`–`P`. Имя (15 байт без хвостовых пробелов), суффикс, NB или NBSTAT, код операции. Ответ: код результата и IPv4 первой целой NB-записи (6 байт). Иначе ярлык снимается. Запрос и ответ не связываются. QUIC и WireGuard по-прежнему только по порту.
 - `Igmp` — v1/v2/v3. Query `0x11`: короче 8 байт → `IgmpType::Query`; ровно 8 и Max Resp = 0 → v1; ровно 8 и Max Resp ≠ 0 → v2; длиннее 8 → v3. `Igmp_Broken` несёт `igmp_type`.
-- `Icmp6` — Echo, ошибки пути, NDP (RS/RA/NS/NA/Redirect), MLD 130–132 и MLDv2 143. У NS — Source LLA (MAC спрашивающего), у NA — Target LLA (MAC объявляемого соседа). Остальные options NDP и записи MLDv2 не разбираются. `Icmp6_Broken` несёт `icmp6_type`.
+- `Icmp6` — Echo, ошибки пути, NDP (RS/RA/NS/NA/Redirect), MLD 130–132 и MLDv2 143. У NS — Source LLA (MAC спрашивающего), у NA — Target LLA (MAC объявляемого соседа). У RA — до 4 префиксов (опция 3, длина /128), до 4 RDNSS, первый домен DNSSL и MTU. Флаги L/A и сроки префикса не читаются. Остальные options NDP и записи MLDv2 не разбираются. `Icmp6_Broken` несёт `icmp6_type`.
 - `Icmp4` — Echo, Dest Unreach (у code 4 ещё MTU), Time Exceeded, Parameter Problem, Redirect, Timestamp, RA/RS. Вложенная дейтаграмма и список адресов RA не читаются. Короче 8 байт или Timestamp не из 20 байт → `Icmp4_Broken` с `icmp4_type`.
 - `Esp` — протокол 50, только SPI. Короче 8 байт → `Esp_Broken`. UDP/4500 остаётся `UdpApp::EspOverUdp`. Ciphertext не читается.
 
@@ -43,7 +65,7 @@ ICMPv4: Echo, Dest Unreach, Redirect, Time Exceeded, Parameter Problem и Timest
 
 **Хвост по-прежнему не читается:**
 
-- Остальные NDP options у RA, NS и NA (префиксы, DNS). MAC соседа у NS (source LLA) и NA (target LLA) читается.
+- Остальные NDP options у NS и NA (префиксы и DNS там не ищутся). У RA читаются префикс, RDNSS, DNSSL и MTU. MAC соседа у NS (source LLA) и NA (target LLA) читается.
 - Список адресов ICMPv4 Router Advertisement.
 - Записи и списки источников MLDv2 Report: вариант `MldV2Report` пустой.
 - Списки источников IGMP v3 обрезаются: не больше 16 адресов и 8 записей групп.

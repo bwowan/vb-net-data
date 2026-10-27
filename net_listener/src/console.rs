@@ -34,10 +34,10 @@ const TOP_ADDR   : usize    = 30;
 const DRAIN_BURST: usize    = 8000;
 
 const ROLE_N     : usize    = 3;
-const L4_N       : usize    = 6;
+const L4_N       : usize    = 7;
 const IP_N       : usize    = 3;
 const DIR_N      : usize    = 4;
-const UDP_N      : usize    = 6;
+const UDP_N      : usize    = 9;
 const ETH_N      : usize    = 9;
 const BUCKETS    : usize    = ROLE_N * L4_N * IP_N * DIR_N * UDP_N * ETH_N;
 
@@ -78,6 +78,7 @@ enum L4 {
     Arp     = 3,
     Esp     = 4,
     None    = 5,
+    Igmp    = 6,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -107,8 +108,11 @@ enum UdpKind {
     Dhcp    = 1,
     Mdns    = 2,
     Ntp     = 3,
-    Other   = 4,
-    NotUdp  = 5,
+    Ssdp    = 4,
+    Llmnr   = 5,
+    Nbns    = 6,
+    Other   = 7,
+    NotUdp  = 8,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -171,6 +175,8 @@ impl Marks {
                 2 => L4::Icmp,
                 3 => L4::Arp,
                 4 => L4::Esp,
+                5 => L4::None,
+                6 => L4::Igmp,
                 _ => L4::None,
             },
             ip:   match ip {
@@ -189,7 +195,10 @@ impl Marks {
                 1 => UdpKind::Dhcp,
                 2 => UdpKind::Mdns,
                 3 => UdpKind::Ntp,
-                4 => UdpKind::Other,
+                4 => UdpKind::Ssdp,
+                5 => UdpKind::Llmnr,
+                6 => UdpKind::Nbns,
+                7 => UdpKind::Other,
                 _ => UdpKind::NotUdp,
             },
             eth:  match eth {
@@ -217,6 +226,7 @@ impl Marks {
             L4::Tcp            => f.tcp,
             L4::Udp            => f.udp,
             L4::Icmp           => f.icmp,
+            L4::Igmp           => f.igmp,
             L4::Arp            => f.arp,
             L4::Esp | L4::None => true,
         };
@@ -236,9 +246,19 @@ impl Marks {
             UdpKind::Dhcp                    => f.dhcp,
             UdpKind::Mdns                    => f.mdns,
             UdpKind::Ntp                     => f.ntp,
+            UdpKind::Ssdp                    => f.ssdp,
+            UdpKind::Llmnr                   => f.llmnr,
+            UdpKind::Nbns                    => f.nbns,
             UdpKind::Other | UdpKind::NotUdp => true,
         };
-        role_ok && l4_ok && ip_ok && dir_ok && udp_ok
+        let eth_ok = match self.eth {
+            EthKind::Lldp  => f.lldp,
+            EthKind::Cisco => f.cisco,
+            EthKind::Dec   => f.dec,
+            EthKind::Ectp  => f.ectp,
+            _              => true,
+        };
+        role_ok && l4_ok && ip_ok && dir_ok && udp_ok && eth_ok
     }
 }
 
@@ -261,29 +281,51 @@ struct Filters {
     dhcp:      bool,
     mdns:      bool,
     ntp:       bool,
+    ssdp:      bool,
+    llmnr:     bool,
+    nbns:      bool,
+    igmp:      bool,
+    lldp:      bool,
+    cisco:     bool,
+    dec:       bool,
+    ectp:      bool,
+}
+
+impl Filters {
+    #[rustfmt::skip]
+    fn all(on: bool) -> Self {
+        Self {
+            data:      on,
+            control:   on,
+            other:     on,
+            tcp:       on,
+            udp:       on,
+            icmp:      on,
+            arp:       on,
+            ipv4:      on,
+            ipv6:      on,
+            incoming:  on,
+            outgoing:  on,
+            broadcast: on,
+            dns:       on,
+            dhcp:      on,
+            mdns:      on,
+            ntp:       on,
+            ssdp:      on,
+            llmnr:     on,
+            nbns:      on,
+            igmp:      on,
+            lldp:      on,
+            cisco:     on,
+            dec:       on,
+            ectp:      on,
+        }
+    }
 }
 
 impl Default for Filters {
-    #[rustfmt::skip]
     fn default() -> Self {
-        Self {
-            data:      true,
-            control:   true,
-            other:     true,
-            tcp:       true,
-            udp:       true,
-            icmp:      true,
-            arp:       true,
-            ipv4:      true,
-            ipv6:      true,
-            incoming:  true,
-            outgoing:  true,
-            broadcast: true,
-            dns:       true,
-            dhcp:      true,
-            mdns:      true,
-            ntp:       true,
-        }
+        Self::all(true)
     }
 }
 
@@ -305,6 +347,14 @@ enum Fid {
     Dhcp,
     Mdns,
     Ntp,
+    Ssdp,
+    Llmnr,
+    Nbns,
+    Igmp,
+    Lldp,
+    Cisco,
+    Dec,
+    Ectp,
 }
 
 impl Filters {
@@ -327,6 +377,14 @@ impl Filters {
             Fid::Dhcp      => self.dhcp,
             Fid::Mdns      => self.mdns,
             Fid::Ntp       => self.ntp,
+            Fid::Ssdp      => self.ssdp,
+            Fid::Llmnr     => self.llmnr,
+            Fid::Nbns      => self.nbns,
+            Fid::Igmp      => self.igmp,
+            Fid::Lldp      => self.lldp,
+            Fid::Cisco     => self.cisco,
+            Fid::Dec       => self.dec,
+            Fid::Ectp      => self.ectp,
         }
     }
 
@@ -350,6 +408,14 @@ impl Filters {
             Fid::Dhcp      => self.dhcp      = bit,
             Fid::Mdns      => self.mdns      = bit,
             Fid::Ntp       => self.ntp       = bit,
+            Fid::Ssdp      => self.ssdp      = bit,
+            Fid::Llmnr     => self.llmnr     = bit,
+            Fid::Nbns      => self.nbns      = bit,
+            Fid::Igmp      => self.igmp      = bit,
+            Fid::Lldp      => self.lldp      = bit,
+            Fid::Cisco     => self.cisco     = bit,
+            Fid::Dec       => self.dec       = bit,
+            Fid::Ectp      => self.ectp      = bit,
         }
     }
 }
@@ -357,9 +423,13 @@ impl Filters {
 enum MenuEntry {
     Head(&'static str),
     Item(Fid, &'static str),
+    /// Пробел ставит все флажки в `on`.
+    All(bool, &'static str),
 }
 
 const MENU: &[MenuEntry] = &[
+    MenuEntry::All(true, "Select all"),
+    MenuEntry::All(false, "Clear all"),
     MenuEntry::Head("Role"),
     MenuEntry::Item(Fid::Data, "Data"),
     MenuEntry::Item(Fid::Control, "Control"),
@@ -368,6 +438,7 @@ const MENU: &[MenuEntry] = &[
     MenuEntry::Item(Fid::Tcp, "TCP"),
     MenuEntry::Item(Fid::Udp, "UDP"),
     MenuEntry::Item(Fid::Icmp, "ICMP"),
+    MenuEntry::Item(Fid::Igmp, "IGMP"),
     MenuEntry::Item(Fid::Arp, "ARP"),
     MenuEntry::Head("IP version"),
     MenuEntry::Item(Fid::Ipv4, "IPv4"),
@@ -381,6 +452,14 @@ const MENU: &[MenuEntry] = &[
     MenuEntry::Item(Fid::Dhcp, "DHCP"),
     MenuEntry::Item(Fid::Mdns, "mDNS"),
     MenuEntry::Item(Fid::Ntp, "NTP"),
+    MenuEntry::Item(Fid::Ssdp, "SSDP"),
+    MenuEntry::Item(Fid::Llmnr, "LLMNR"),
+    MenuEntry::Item(Fid::Nbns, "NBNS"),
+    MenuEntry::Head("Link"),
+    MenuEntry::Item(Fid::Lldp, "LLDP"),
+    MenuEntry::Item(Fid::Cisco, "Cisco"),
+    MenuEntry::Item(Fid::Dec, "DEC"),
+    MenuEntry::Item(Fid::Ectp, "ECTP"),
 ];
 
 #[derive(Clone, Copy, Default)]
@@ -660,14 +739,20 @@ fn on_filter_key(model: &mut Model, code: KeyCode) {
             model.redraw = true;
         }
         KeyCode::Char(' ') => {
-            if let MenuEntry::Item(id, _) = MENU[model.filter_cursor] {
-                model.filters.toggle(id);
-                model.list_dirty = true;
-                model.redraw = true;
+            match MENU[model.filter_cursor] {
+                MenuEntry::Item(id, _) => model.filters.toggle(id),
+                MenuEntry::All(on, _) => model.filters = Filters::all(on),
+                MenuEntry::Head(_) => return,
             }
+            model.list_dirty = true;
+            model.redraw = true;
         }
         _ => {}
     }
+}
+
+fn menu_selectable(entry: &MenuEntry) -> bool {
+    matches!(entry, MenuEntry::Item(_, _) | MenuEntry::All(_, _))
 }
 
 fn step_menu(cur: usize, delta: isize) -> usize {
@@ -677,7 +762,7 @@ fn step_menu(cur: usize, delta: isize) -> usize {
         if i < 0 || i >= MENU.len() as isize {
             return cur;
         }
-        if matches!(MENU[i as usize], MenuEntry::Item(_, _)) {
+        if menu_selectable(&MENU[i as usize]) {
             return i as usize;
         }
     }
@@ -756,11 +841,20 @@ fn draw_report(frame: &mut ratatui::Frame, model: &mut Model) {
     );
 }
 
+fn filter_line(body: &str, cursor: bool) -> Line<'static> {
+    let body = body.to_string();
+    if cursor {
+        Line::styled(body, Style::default().bg(Color::DarkGray).fg(Color::White))
+    } else {
+        Line::from(body)
+    }
+}
+
 fn draw_filters(frame: &mut ratatui::Frame, model: &mut Model) {
     let rows = frame.area().height as usize;
     model.keep_filter_visible(rows);
     let mut text = vec![Line::styled(
-        "Filters    Space toggles    f or Esc returns",
+        "Filters    use Space to toggle and to Select all / Clear all    f or Esc returns",
         Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
     )];
     let start = model.filter_scroll;
@@ -774,13 +868,9 @@ fn draw_filters(frame: &mut ratatui::Frame, model: &mut Model) {
             ),
             MenuEntry::Item(id, label) => {
                 let mark = if model.filters.get(*id) { "[x]" } else { "[ ]" };
-                let body = format!(" {mark} {label}");
-                if cursor {
-                    Line::styled(body, Style::default().bg(Color::DarkGray).fg(Color::White))
-                } else {
-                    Line::from(body)
-                }
+                filter_line(&format!(" {mark} {label}"), cursor)
             }
+            MenuEntry::All(_, label) => filter_line(&format!(" {label}"), cursor),
         };
         text.push(line);
     }
@@ -801,7 +891,7 @@ impl Model {
     fn new() -> Self {
         let zero = vec![Tot::default(); BUCKETS];
         let mut cursor = 0;
-        while !matches!(MENU[cursor], MenuEntry::Item(_, _)) {
+        while !menu_selectable(&MENU[cursor]) {
             cursor += 1;
         }
         Self {
@@ -1072,10 +1162,11 @@ impl Model {
 fn push_protocols(lines: &mut Vec<ReportLine>, model: &Model) {
     head(lines, "Protocols");
     let mut any = false;
-    let specs: [(L4, &str); 5] = [
+    let specs: [(L4, &str); 6] = [
         (L4::Tcp, "TCP"),
         (L4::Udp, "UDP"),
-        (L4::Icmp, "ICMP/IGMP"),
+        (L4::Icmp, "ICMP"),
+        (L4::Igmp, "IGMP"),
         (L4::Arp, "ARP"),
         (L4::Esp, "ESP"),
     ];
@@ -1416,7 +1507,11 @@ fn fill_ip(marks: &mut Marks, ip: &IpData) {
                 Role::Data
             };
         }
-        IpL4::Igmp(_) | IpL4::Icmp4(_) | IpL4::Icmp6(_) => {
+        IpL4::Igmp(_) => {
+            marks.role = Role::Control;
+            marks.l4 = L4::Igmp;
+        }
+        IpL4::Icmp4(_) | IpL4::Icmp6(_) => {
             marks.role = Role::Control;
             marks.l4 = L4::Icmp;
         }
@@ -1451,6 +1546,9 @@ fn udp_kind(app: UdpApp) -> UdpKind {
         UdpApp::Dhcp4 | UdpApp::Dhcp6 => UdpKind::Dhcp,
         UdpApp::Mdns                  => UdpKind::Mdns,
         UdpApp::Ntp                   => UdpKind::Ntp,
+        UdpApp::Ssdp                  => UdpKind::Ssdp,
+        UdpApp::Llmnr                 => UdpKind::Llmnr,
+        UdpApp::Nbns                  => UdpKind::Nbns,
         _                             => UdpKind::Other,
     }
 }
@@ -1479,7 +1577,7 @@ fn eth_kind(data: &NetData) -> EthKind {
 
 #[cfg(test)]
 mod tests {
-    use common::{ ArpData, EthData };
+    use common::{ArpData, CDP_CISCO_DATA, CiscoData, EthData, Icmp4Data, IgmpData, IgmpV2, LLDP_Data};
     use super::*;
     use std::net::Ipv4Addr;
 
@@ -1630,6 +1728,87 @@ mod tests {
 
     fn report_text(model: &Model) -> String {
         model.lines.iter().map(|line| line.text.as_str()).collect::<Vec<_>>().join("\n")
+    }
+
+    /// Select all включает все флажки, Clear all выключает.
+    #[test]
+    fn filter_select_and_clear_all() {
+        let mut model = Model::new();
+        model.mode = Mode::Filters;
+        model.filters.toggle(Fid::Dns);
+        model.filter_cursor = menu_pos(false);
+        on_filter_key(&mut model, KeyCode::Char(' '));
+        assert!(!model.filters.get(Fid::Dns));
+        assert!(!model.filters.get(Fid::Cisco));
+        assert!(model.list_dirty);
+        model.filter_cursor = menu_pos(true);
+        on_filter_key(&mut model, KeyCode::Char(' '));
+        assert!(model.filters.get(Fid::Dns));
+        assert!(model.filters.get(Fid::Cisco));
+    }
+
+    fn menu_pos(on: bool) -> usize {
+        MENU.iter().position(|entry| matches!(entry, MenuEntry::All(bit, _) if *bit == on)).unwrap()
+    }
+
+    /// Cisco и LLDP прячутся своими флажками. Соседний тип остаётся в списке управления.
+    #[test]
+    fn filter_hides_cisco_keeps_lldp() {
+        let mut model = Model::new();
+        model.ingest(&frame(
+            NetPayload::Cisco(CiscoData::CDP(CDP_CISCO_DATA::default())),
+            EthType::Unsupported,
+            EDirection::Incoming,
+        ));
+        model.ingest(&frame(
+            NetPayload::Lldp(LLDP_Data::default()),
+            EthType::Lldp,
+            EDirection::Incoming,
+        ));
+        model.filters.toggle(Fid::Cisco);
+        model.rebuild();
+        let text = report_text(&model);
+        assert!(!text.contains("CDP"));
+        assert!(text.contains("LLDP"));
+    }
+
+    /// SSDP и IGMP прячутся своими флажками. DNS и ICMP остаются.
+    #[test]
+    fn filter_hides_ssdp_and_igmp() {
+        let mut model = Model::new();
+        model.ingest(&udp_app(UdpApp::Ssdp, 1900));
+        model.ingest(&udp_app(UdpApp::Dns, 53));
+        model.ingest(&ip_l4(IpL4::Igmp(IgmpData::V2Leave(IgmpV2 {
+            max_resp_time: 0,
+            checksum: 0,
+            group: Ipv4Addr::new(224, 0, 0, 2),
+        }))));
+        model.ingest(&ip_l4(IpL4::Icmp4(Icmp4Data::RouterSolicitation)));
+        model.filters.toggle(Fid::Ssdp);
+        model.filters.toggle(Fid::Igmp);
+        model.rebuild();
+        let text = report_text(&model);
+        assert!(!text.contains("SSDP"));
+        assert!(!text.contains("IGMPv2"));
+        assert!(text.contains("DNS"));
+        assert!(text.contains("ICMPv4"));
+    }
+
+    fn udp_app(app: UdpApp, port: u16) -> NetData {
+        ip_l4(IpL4::Udp { src_port: port, dst_port: port, app, msg: None })
+    }
+
+    fn ip_l4(l4: IpL4) -> NetData {
+        frame(
+            NetPayload::Ip(IpData {
+                src: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+                dst: IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1)),
+                len: 40,
+                l4,
+            }),
+            EthType::Ipv4,
+            EDirection::Outgoing,
+        )
     }
 
     /// Индекс корзины однозначно кодирует метки кадра.

@@ -57,7 +57,7 @@ async fn main() -> Result<()> {
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
-    let num_parsers = (cores / 3).min(1);
+    let num_parsers = if cores < 4 { 1 } else { cores / 3 };
     println!("Logical cores: {cores}; parser tasks: {num_parsers}");
 
     let shutdown_flag: Arc<_> = Arc::new(AtomicBool::new(false));

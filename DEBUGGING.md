@@ -1,120 +1,81 @@
-# Debugging Guide for NetData Project
+# Debugging Guide for NetData
 
-## Common Issues and Solutions
+Cargo writes binaries to `/tmpu/NetData` (`.cargo/config.toml`, `target-dir`), not to `target/`.
 
-### Issue: Cannot start debugging net_listener
+- Listener: `/tmpu/NetData/debug/net_listener`
+- Visualizer: `/tmpu/NetData/debug/net_visualizator`
 
-#### Possible Causes:
+The listener needs `cap_net_raw` and `cap_net_admin`. The visualizer does not.
 
-1. **Missing CodeLLDB Extension**
-   - Install the "CodeLLDB" extension in VS Code
-   - Or use the native lldb debugger if available
+```bash
+cargo build --bin net_listener
+sudo setcap cap_net_raw,cap_net_admin=eip /tmpu/NetData/debug/net_listener
+```
 
-2. **Permission Issues (CAP_NET_RAW required)**
-   - `net_listener` requires CAP_NET_RAW capability to capture packets
-   - Try running with sudo:
-     ```bash
-     sudo ./target/debug/net_listener
-     ```
-   - Or set capabilities:
-     ```bash
-     sudo setcap cap_net_raw,cap_net_admin=eip target/debug/net_listener
-     ```
+Logs, because the listener's terminal is the ratatui screen:
 
-3. **Workspace Configuration**
-   - Make sure you're in the workspace root directory
-   - The `cwd` should be set to `${workspaceFolder}`
+- `/tmpu/net_listener.log`
+- `/tmpu/net_visualizator.log`
 
-4. **Binary Not Built**
-   - Build the project first:
-     ```bash
-     cargo build --bin net_listener
-     ```
-   - Or use the "Debug executable 'net_listener' (built binary)" configuration
+## Launch configs
 
-### How to Debug:
+Open the workspace root `/mnt/DevData/Rust/NetData`. Configs are in `.vscode/launch.json` (CodeLLDB, `"type": "lldb"`):
 
-1. **Using VS Code Debugger:**
-   - Press F5 or go to Run and Debug
-   - Select "Debug executable 'net_listener'"
-   - Set breakpoints in the code
-   - The debugger should attach and stop at breakpoints
+- `Debug executable 'net_listener'` — build, then setcap on `/tmpu/NetData/debug/net_listener`
+- `Debug executable 'net_listener' (built binary)` — same binary path
+- `Debug executable 'net_visualizator'`
+- unit tests for `common`, `net_listener`, and `net_visualizator`
 
-2. **Using Command Line:**
-   ```bash
-   # Build with debug symbols
-   cargo build --bin net_listener
-   
-   # Run with lldb
-   lldb target/debug/net_listener
-   (lldb) breakpoint set -f main.rs -l 33
-   (lldb) run
-   ```
+Open the `net_listener` folder and the configs in `net_listener/.vscode/launch.json` are different. `Debug as Root (via lldb-server)` expects a server that is already running:
 
-3. **If Permission Issues:**
-   ```bash
-   # Option 1: Run with sudo (not recommended for debugging)
-   sudo lldb target/debug/net_listener
-   
-   # Option 2: Set capabilities (recommended)
-   sudo setcap cap_net_raw,cap_net_admin=eip target/debug/net_listener
-   ./target/debug/net_listener
-   ```
+```bash
+sudo lldb-server platform --listen "*:1234" --server
+```
 
-### Troubleshooting:
+The setcap tasks in that nested folder still name `target/debug`. Cargo does not write the binary there. Set the capability on `/tmpu/NetData/debug/net_listener`, or use the root task `Build-net_listener-setCap`.
 
-- **Linker Error: `cannot find -lpcap: No such file or directory`**
-  
-  This means the libpcap development package is not installed. Install it:
-  
-  **Ubuntu/Debian:**
-  ```bash
-  sudo apt-get install libpcap-dev
-  ```
-  
-  **Fedora/RHEL/CentOS:**
-  ```bash
-  sudo dnf install libpcap-devel
-  ```
-  
-  **Arch Linux:**
-  ```bash
-  sudo pacman -S libpcap
-  ```
-  
-  After installation, rebuild the project:
-  ```bash
-  cargo clean
-  cargo build --bin net_listener
-  ```
+## Command line
 
-- **Check if lldb is installed:**
-  ```bash
-  which lldb
-  ```
+```bash
+cargo build --bin net_listener
+sudo setcap cap_net_raw,cap_net_admin=eip /tmpu/NetData/debug/net_listener
+lldb /tmpu/NetData/debug/net_listener
+```
 
-- **Check if CodeLLDB extension is installed in VS Code**
-  - Go to Extensions (Ctrl+Shift+X)
-  - Search for "CodeLLDB"
-  - Install if not present
+`sudo lldb` also works. Setcap is the usual path.
 
-- **Verify Cargo.toml workspace configuration:**
-  - Make sure `net_listener` is listed in workspace members
-  - Check that the package name matches
+## Troubleshooting
 
-- **Check build output:**
-  ```bash
-  cargo build --bin net_listener --verbose
-  ```
+### `cannot find -lpcap`
 
-- **Verify libpcap installation:**
-  ```bash
-  # Check if libpcap-dev is installed (Ubuntu/Debian)
-  dpkg -l | grep libpcap-dev
-  
-  # Check if library is available
-  ldconfig -p | grep pcap
-  
-  # Check pkg-config
-  pkg-config --modversion libpcap
-  ```
+The libpcap development package is missing.
+
+**Ubuntu/Debian:**
+
+```bash
+sudo apt-get install libpcap-dev
+```
+
+**Fedora/RHEL:**
+
+```bash
+sudo dnf install libpcap-devel
+```
+
+**Arch Linux:**
+
+```bash
+sudo pacman -S libpcap
+```
+
+Then rebuild. The binary appears under `/tmpu/NetData/debug/`.
+
+### Check the toolchain
+
+```bash
+which lldb
+pkg-config --modversion libpcap
+ldconfig -p | grep pcap
+```
+
+CodeLLDB: Extensions, search "CodeLLDB". The root launch configs use it.

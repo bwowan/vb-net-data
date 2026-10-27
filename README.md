@@ -1,8 +1,8 @@
 # NetData Project
 
 A Rust project for network packet capture and visualization consisting of two applications:
-- `net_listener`: Console application for packet capture and analysis
-- `net_visualizator`: 3D visualization application using Bevy
+- `net_listener`: captures packets, parses them, shows a terminal UI, and sends `NetData` frames on a Unix datagram socket
+- `net_visualizator`: native egui window that reads those frames
 
 ## Protocols parsed by `net_listener`
 
@@ -34,31 +34,42 @@ Other Cisco SNAP ids (CGMP, VTP, DTP, PAgP, PVST+, UDLD) and any other OUI are r
 | Protocol | What is kept |
 |---|---|
 | TCP | Source and destination ports. |
-| UDP | Ports, plus an application label taken from either port. The more specific label wins: DHCP / mDNS / SSDP, then DNS / LLMNR / NTP, then QUIC / WireGuard / ESP-over-UDP. |
+| UDP | Ports, plus an application label taken from either port. The more specific label wins: DHCP / DHCPv6 / mDNS / SSDP, then DNS / LLMNR / NBNS / NTP, then QUIC / WireGuard / ESP-over-UDP. |
 | ICMPv4 | Echo (id, sequence), Destination Unreachable (code, and next-hop MTU when the code is 4), Time Exceeded, Parameter Problem, Redirect (code and gateway), Timestamp, Router Advertisement / Solicitation. The embedded original datagram and the RA address list are not read. |
-| ICMPv6 | Echo, Destination Unreachable, Packet Too Big, Time Exceeded, Parameter Problem, NDP (Router Solicitation/Advertisement, Neighbor Solicitation/Advertisement, Redirect), MLD Query/Report/Done, and MLDv2 Report. NDP options and MLDv2 records are not read. |
+| ICMPv6 | Echo, Destination Unreachable, Packet Too Big, Time Exceeded, Parameter Problem, NDP (Router Solicitation/Advertisement, Neighbor Solicitation/Advertisement, Redirect), MLD Query/Report/Done, and MLDv2 Report. Neighbor Solicitation keeps the source link-layer address, Neighbor Advertisement the target one. Other NDP options and MLDv2 records are not read. |
 | IGMP | v1 and v2 Query, Report, and Leave. v3 Query and Report, with at most 16 source addresses and 8 group records. |
 | ESP (protocol 50) | SPI and the payload length. Sequence, ciphertext, and ICV are not read. |
 
-UDP labels that stay on the port alone: DHCPv6 (546/547), SSDP (1900), NTP (123), QUIC (443), WireGuard (51820), ESP-over-UDP (4500).
+These UDP labels are checked against the payload. A body that does not match drops the label and leaves plain UDP:
 
-Two of those labels are checked against the payload:
+- **DNS, mDNS, and LLMNR** (53, 5353, 5355). The first question name is kept, up to 64 characters, including compressed names. Answers may keep the first SRV record (port and target host). mDNS also keeps the `_service._proto` labels and the name from the first PTR record.
+- **DHCPv4** (67/68) must carry magic cookie `0x63825363`. Option 53 is the message type (Discover, Offer, Request, Decline, Ack, Nak, Release, Inform). Option 12 is the hostname (up to 64 characters). Option 50 is the requested IPv4, and only when it is exactly 4 bytes.
+- **SSDP** (1900). The start line is `M-SEARCH`, `NOTIFY`, or `HTTP/1.x`. Headers kept: `NT`, `USN`, `LOCATION` (up to 128 characters).
+- **DHCPv6** (546/547). The message type is the first byte, types 1–13, when the message is long enough (at least 4 bytes, relay types 12–13 at least 34). Transaction id and options are not read.
+- **NBNS** (137). The first label is 32 characters `A`–`P`. Kept: the name, suffix, NB or NBSTAT, and the opcode. A reply also keeps the result code and the IPv4 of the first complete NB record.
 
-- **DNS, mDNS, and LLMNR** (53, 5353, 5355) must look like a DNS message. The first question name is kept, up to 64 characters, including compressed names. If the name is broken, the packet stays UDP without the DNS label. mDNS also keeps the `_service._proto` labels and the name from the first PTR record.
-- **DHCPv4** (67/68) must carry magic cookie `0x63825363`. Option 53 supplies Discover, Offer, Request, Decline, Ack, Nak, Release, or Inform. Without the cookie the packet stays plain UDP.
+Labels that stay on the port alone: NTP (123), QUIC (443), WireGuard (51820), ESP-over-UDP (4500).
 
 Anything else above IP (GRE, SCTP, AH as the final header, and the rest of the IANA numbers) is an unsupported L4 protocol.
 
-## TODO: more LAN protocols
+## Not parsed yet
 
-Next parses for a local network, in this order:
+Left for later. Do not start these without a request.
 
-1. Neighbor MAC from NDP options on Neighbor Solicitation and Neighbor Advertisement.
-2. DHCPv4 hostname (option 12) and the requested IP address.
-3. SSDP (UDP 1900): the start line plus `NT`, `USN`, and `LOCATION`.
-4. DHCPv6 (546/547): message type from the first byte.
+On the LAN, when that traffic is present:
 
-Only when that traffic is on the LAN: NetBIOS Name Service (UDP 137); STP/RSTP BPDUs (LLC DSAP/SSAP `0x42`, not SNAP); a WireGuard header check on UDP 51820.
+- STP/RSTP BPDUs (LLC DSAP/SSAP `0x42`, not SNAP).
+- A WireGuard header check on UDP 51820. Today the label is the port alone.
+
+Still unread inside messages that are already recognized:
+
+- Other NDP options on Router Advertisement, Neighbor Solicitation, and Neighbor Advertisement (prefixes, DNS). The neighbor MAC on NS and NA is already kept.
+- The ICMPv4 Router Advertisement address list.
+- MLDv2 Report records and their source lists. The `MldV2Report` variant is empty.
+- IGMP v3 source lists past 16 addresses, and group records past 8.
+- QUIC beyond the port label.
+
+Checksums, fragment reassembly, AH, GRE, and SCTP are not implemented.
 
 ## Prerequisites
 
@@ -94,21 +105,32 @@ sudo pacman -S --needed \
 
 ## Building
 
-Build all projects:
+### Native (desktop)
+
+Build the whole workspace:
 
 ```bash
 cargo build --workspace
 ```
 
-Build individual projects:
+Build individual binaries:
 
 ```bash
-# Build net_listener
 cargo build --bin net_listener
-
-# Build net_visualizator
 cargo build --bin net_visualizator
 ```
+
+Release build for the visualizer:
+
+```bash
+cargo build --release --bin net_visualizator
+```
+
+`net_listener` needs the libpcap development package (see Prerequisites). The GUI binary only needs a normal Rust toolchain.
+
+### WASM (browser)
+
+The UI library uses `web-time`, so `Instant::now` will not panic on wasm32. There is no browser entry: no `eframe::WebRunner`, `index.html`, `Trunk.toml`, or WebSocket source.
 
 ## Running
 
@@ -123,23 +145,33 @@ sudo cargo run --bin net_listener
 
 Option 2: Set capabilities (recommended)
 ```bash
-# Build first
+# Build first. .cargo/config.toml sets target-dir to /tmpu/NetData.
 cargo build --bin net_listener
 
 # Set capabilities
-sudo setcap cap_net_raw,cap_net_admin=eip target/debug/net_listener
+sudo setcap cap_net_raw,cap_net_admin=eip /tmpu/NetData/debug/net_listener
 
 # Run without sudo
-./target/debug/net_listener
+/tmpu/NetData/debug/net_listener
 ```
 
-### Running net_visualizator
+### Running net_visualizator (native)
 
 ```bash
 cargo run --bin net_visualizator
 ```
 
-**Note:** Start `net_visualizator` before `net_listener` to ensure the Unix Domain Socket is available.
+Optional socket paths:
+
+```bash
+cargo run --bin net_visualizator -- \
+  --listener /tmpu/net_listener_stats2.sock \
+  --socket /tmpu/net_visualizator.sock
+```
+
+Either process can start first. The visualizer binds `/tmpu/net_visualizator.sock` and sends a hello to `/tmpu/net_listener_stats2.sock` once a second until frames arrive. The listener binds its own socket and sends frames to whoever sent that hello.
+
+Logs: `/tmpu/net_listener.log`, `/tmpu/net_visualizator.log`.
 
 ## Troubleshooting
 
@@ -166,7 +198,7 @@ sudo pacman -S libpcap
 
 Set the required capabilities:
 ```bash
-sudo setcap cap_net_raw,cap_net_admin=eip target/debug/net_listener
+sudo setcap cap_net_raw,cap_net_admin=eip /tmpu/NetData/debug/net_listener
 ```
 
 See [DEBUGGING.md](DEBUGGING.md) for more debugging information.

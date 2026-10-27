@@ -1,197 +1,170 @@
-use std::os::unix::net::UnixDatagram;
-use std::sync::Arc;
+//! Нативный GUI. Кадры приходят датаграммами от `net_listener` (`ipc_sender`).
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use anyhow::Result;
-use bevy::prelude::*;
-use common::{NetMessage, TrafficStats};
-use tokio::runtime::Runtime;
-use tokio::sync::mpsc;
+use anyhow::{Context, Result, anyhow, bail};
+use net_visualizator::app::App;
+use net_visualizator::source::{DataSource, UdsSource};
+use net_visualizator::store::Store;
 
-/// Сообщение от потока приема к Bevy.
-#[derive(Debug)]
-enum StatsMessage {
-    Update(TrafficStats),
-}
+const DEFAULT_LISTENER: &str = "/tmpu/net_listener_stats2.sock"; // сокет `net_listener` (`SOCKET_PATH` в его `main`)
+const DEFAULT_SOCKET: &str = "/tmpu/net_visualizator.sock"; // наш сокет: без bind клиенту некому отвечать
+const BATCH_MAX: usize = 64; // сколько кадров копить, прежде чем брать мьютекс Store
+const BATCH_WAIT: Duration = Duration::from_millis(20); // или сколько ждать пачку, если кадров меньше
+const LINK_EVERY: Duration = Duration::from_millis(100); // даже без кадров раз в это время обновляем линк в Store
+const IDLE_SLEEP: Duration = Duration::from_millis(2); // пауза при пустом `poll`, как у `ipc_sender`
 
-/// Обертка над TrafficStats для использования как Bevy Resource.
-#[derive(Resource, Debug, Clone)]
-struct TrafficStatsResource(TrafficStats);
-
-impl Default for TrafficStatsResource {
-    fn default() -> Self {
-        Self(TrafficStats::default())
-    }
-}
-
-impl std::ops::Deref for TrafficStatsResource {
-    type Target = TrafficStats;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl std::ops::DerefMut for TrafficStatsResource {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
+struct Args {
+    listener: String, // путь сокета `net_listener`
+    socket: String,   // путь, который биндим сами
 }
 
 fn main() -> Result<()> {
-    // Канал между потоком приема UDS и Bevy-миром.
-    let (stats_tx, stats_rx) = mpsc::unbounded_channel::<StatsMessage>();
+    let args = parse_args()?;
+    init_log()?;
 
-    // Первый поток: прием статистики по Unix Domain Socket.
-    let socket_path = "/tmp/net_visualizator_stats.sock";
-    let _ = std::fs::remove_file(socket_path);
-    let uds = UnixDatagram::bind(socket_path)?;
-    uds.set_nonblocking(true)?;
-    let uds = Arc::new(uds);
+    let source = UdsSource::open(&args.socket, &args.listener)
+        .with_context(|| format!("bind {}", args.socket))?;
+    let store = Arc::new(Mutex::new(Store::new()));
+    let paused = Arc::new(AtomicBool::new(false));
+    let shutdown = Arc::new(AtomicBool::new(false));
 
-    let _receiver_thread = {
-        let uds = uds.clone();
-        let stats_tx = stats_tx.clone();
-        thread::spawn(move || loop {
-            let mut buf = [0u8; 2048];
-            match uds.recv(&mut buf) {
-                Ok(len) => {
-                    let slice = &buf[..len];
-                    if let Ok(message) = serde_json::from_slice::<NetMessage>(slice) {
-                        match message {
-                            NetMessage::TrafficStats(stats) => {
-                                let _ = stats_tx.send(StatsMessage::Update(stats));
-                            }
-                        }
-                    }
-                }
-                Err(_) => {
-                    // Неблокирующий сокет — просто подождем чуть-чуть.
-                    thread::sleep(Duration::from_millis(100));
-                }
-            }
-        })
+    // Приём в отдельном потоке: UI не должен блокироваться на UDS.
+    let rx = {
+        let store = Arc::clone(&store);
+        let paused = Arc::clone(&paused);
+        let shutdown = Arc::clone(&shutdown);
+        thread::Builder::new()
+            .name("netviz-rx".into())
+            .spawn(move || {
+                receive(source, store, paused, shutdown);
+            })?
     };
 
-    // Второй «поток» — Bevy (внутри много собственных потоков).
-    // Оборачиваем tokio-runtime, чтобы иметь возможность non-blocking получать
-    // статистику и класть её в ресурс Bevy.
-    let rt = Runtime::new()?;
-
-    App::new()
-        .insert_resource(TrafficStatsResource::default())
-        .insert_resource(StatsChannel { rt, stats_rx })
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                title: "Net Visualizator - Overview".into(),
-                resolution: (1280_f32, 720_f32).into(),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }))
-        // Дополнительное окно с другими данными (пока просто пустое).
-        .add_systems(Startup, setup_windows)
-        .add_systems(Startup, setup_scene)
-        .add_systems(Update, (pull_stats_from_channel, animate_from_stats))
-        .run();
-
-    // App::run() не возвращает управление
+    let app_store    = Arc::clone(&store);
+    let app_paused   = Arc::clone(&paused);
+    let app_shutdown = Arc::clone(&shutdown);
+    let listener = args.listener.clone();
+    let native = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1280.0, 800.0])
+            .with_maximized(true)
+            .with_title("Net Visualizator"),
+        ..Default::default()
+    };
+    let run = eframe::run_native(
+        "net_visualizator",
+        native,
+        Box::new(move |_cc| {
+            Ok(Box::new(App::new(
+                app_store,
+                app_paused,
+                app_shutdown,
+                listener,
+            )))
+        }),
+    );
+    // Окно закрыто (или упало): просим поток приёма выйти и ждём его.
+    shutdown.store(true, Ordering::Relaxed);
+    let _ = rx.join();
+    run.map_err(|err| anyhow!(err))?;
     Ok(())
 }
 
-/// Ресурс, обеспечивающий доступ к каналу и tokio-runtime
-/// для неблокирующего приема статистики.
-#[derive(Resource)]
-struct StatsChannel {
-    rt: Runtime,
-    stats_rx: mpsc::UnboundedReceiver<StatsMessage>,
-}
-
-fn setup_windows(mut commands: Commands) {
-    // Вторичное окно — позже здесь можно будет рисовать другой тип статистики.
-    commands.spawn(Window {
-        title: "Net Visualizator - Details".into(),
-        resolution: (800_f32, 600_f32).into(),
-        ..Default::default()
-    });
-}
-
-fn setup_scene(
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+/// `poll` не блокируется. Пустой ответ — сон 2 мс. В мьютекс кладём пачку,
+/// не каждый кадр: до 64 штук или 20 мс. Состояние линка обновляется и без кадров.
+fn receive(
+    mut source: UdsSource,
+    store: Arc<Mutex<Store>>,
+    paused: Arc<AtomicBool>,
+    shutdown: Arc<AtomicBool>,
 ) {
-    // Камера
-    commands.spawn(Camera3dBundle::default());
-
-    // Примитивный объект, который будем анимировать в зависимости от статистики.
-    commands.spawn((
-        PbrBundle {
-            mesh: meshes.add(Cuboid::new(1.0, 1.0, 1.0)),
-            material: materials.add(StandardMaterial {
-                base_color: Color::srgb(0.0, 1.0, 0.0),
-                ..Default::default()
-            }),
-            transform: Transform::from_xyz(0.0, 0.5, 0.0),
-            ..Default::default()
-        },
-        StatsVisualMarker,
-    ));
-
-    // Источник света.
-    commands.spawn(PointLightBundle {
-        point_light: PointLight {
-            intensity: 1500.0,
-            shadows_enabled: true,
-            ..Default::default()
-        },
-        transform: Transform::from_xyz(4.0, 8.0, 4.0),
-        ..Default::default()
-    });
-}
-
-#[derive(Component)]
-struct StatsVisualMarker;
-
-/// Забираем статистику из канала и обновляем ресурс `TrafficStatsResource`.
-fn pull_stats_from_channel(
-    mut stats: ResMut<TrafficStatsResource>,
-    mut stats_chan: ResMut<StatsChannel>,
-) {
-    // Получаем все доступные сообщения, не блокируясь на кадр.
-    // Используем try_recv для неблокирующего получения
-    loop {
-        match stats_chan.stats_rx.try_recv() {
-            Ok(StatsMessage::Update(new_stats)) => {
-                stats.0 = new_stats;
+    let mut batch = Vec::new();
+    let mut scratch = Vec::new();
+    let mut last_flush = Instant::now();
+    while !shutdown.load(Ordering::Relaxed) {
+        scratch.clear();
+        source.poll(&mut scratch);
+        let idle = scratch.is_empty();
+        batch.append(&mut scratch);
+        let age = last_flush.elapsed();
+        let flush = batch.len() >= BATCH_MAX
+            || (!batch.is_empty() && age >= BATCH_WAIT)
+            || age >= LINK_EVERY;
+        if flush {
+            let mut guard = store.lock().unwrap_or_else(|err| err.into_inner());
+            // Пауза: статистика и соединения растут, кольцо не пишется.
+            let keep = !paused.load(Ordering::Relaxed);
+            for data in batch.drain(..) {
+                guard.ingest(data, keep);
             }
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
-                // Нет сообщений, выходим
-                break;
-            }
-            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                // Канал закрыт
-                break;
-            }
+            guard.tick();
+            guard.evict_conns();
+            guard.set_link(source.state());
+            guard.set_decode_errors(source.decode_errors());
+            last_flush = Instant::now();
+        }
+        if idle {
+            thread::sleep(IDLE_SLEEP);
         }
     }
 }
 
-/// Простая «3D-визуализация» — меняем размер/позицию объекта в зависимости от трафика.
-fn animate_from_stats(
-    stats: Res<TrafficStatsResource>,
-    mut query: Query<&mut Transform, With<StatsVisualMarker>>,
-) {
-    if !stats.is_changed() {
-        return;
-    }
-
-    let total_packets = stats.total_packets() as f32;
-    let scale = 1.0 + (total_packets.log10().max(0.0) * 0.1);
-
-    for mut transform in &mut query {
-        transform.scale = Vec3::splat(scale);
-        transform.translation.y = 0.5 * scale;
-    }
+/// Лог в файл, как у `net_listener`: stdout занят окном / отладчиком.
+fn init_log() -> Result<()> {
+    let log_file = match std::fs::File::create("/tmpu/net_visualizator.log") {
+        Ok(file) => file,
+        Err(err) => {
+            eprintln!("Failed to create /tmpu/net_visualizator.log: {err}");
+            return Err(err.into());
+        }
+    };
+    tracing_subscriber::fmt()
+        .with_writer(log_file)
+        .with_ansi(false)
+        .try_init()
+        .map_err(|err| anyhow!(err))?;
+    Ok(())
 }
 
+fn parse_args() -> Result<Args> {
+    let mut listener = DEFAULT_LISTENER.to_string();
+    let mut socket = DEFAULT_SOCKET.to_string();
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--listener" => {
+                listener = args
+                    .next()
+                    .ok_or_else(|| anyhow!("--listener needs a path"))?;
+            }
+            "--socket" => {
+                socket = args
+                    .next()
+                    .ok_or_else(|| anyhow!("--socket needs a path"))?;
+            }
+            "-h" | "--help" => {
+                usage();
+                std::process::exit(0);
+            }
+            other => {
+                usage();
+                bail!("unknown argument {other}");
+            }
+        }
+    }
+    Ok(Args { listener, socket })
+}
+
+fn usage() {
+    eprintln!(
+        "\
+net_visualizator [--listener PATH] [--socket PATH]
+
+  --listener   сокет net_listener (по умолчанию {DEFAULT_LISTENER})
+  --socket     наш сокет (по умолчанию {DEFAULT_SOCKET})"
+    );
+}

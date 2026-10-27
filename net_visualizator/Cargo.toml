@@ -3,9 +3,22 @@ name = "net_visualizator"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "net_visualizator"
+path = "src/main.rs"
+
 [dependencies]
-tokio = { version = "1.41", features = ["full"] }
-bevy = { version = "0.14", default-features = false, features = ["bevy_winit", "bevy_render", "bevy_pbr", "bevy_asset", "x11"] }
-anyhow = "1.0"
-serde_json = "1.0"
+eframe = "0.37"
+egui = "0.37"
+egui_extras = "0.37"
 common = { path = "../common" }
+web-time = "1"
+anyhow = "1.0"
+tracing = "0.1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tracing-subscriber = "0.3"
+libc = "0.2"
