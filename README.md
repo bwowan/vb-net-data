@@ -36,16 +36,16 @@ Other Cisco SNAP ids (CGMP, VTP, DTP, PAgP, PVST+, UDLD) and any other OUI are r
 | TCP | Source and destination ports. |
 | UDP | Ports, plus an application label taken from either port. The more specific label wins: DHCP / DHCPv6 / mDNS / SSDP, then DNS / LLMNR / NBNS / NTP, then QUIC / WireGuard / ESP-over-UDP. |
 | ICMPv4 | Echo (id, sequence), Destination Unreachable (code, and next-hop MTU when the code is 4), Time Exceeded, Parameter Problem, Redirect (code and gateway), Timestamp, Router Advertisement / Solicitation. The embedded original datagram and the RA address list are not read. |
-| ICMPv6 | Echo, Destination Unreachable, Packet Too Big, Time Exceeded, Parameter Problem, NDP (Router Solicitation/Advertisement, Neighbor Solicitation/Advertisement, Redirect), MLD Query/Report/Done, and MLDv2 Report. Neighbor Solicitation keeps the source link-layer address, Neighbor Advertisement the target one. Other NDP options and MLDv2 records are not read. |
+| ICMPv6 | Echo, Destination Unreachable, Packet Too Big, Time Exceeded, Parameter Problem, NDP (Router Solicitation/Advertisement, Neighbor Solicitation/Advertisement, Redirect), MLD Query/Report/Done, and MLDv2 Report. Neighbor Solicitation keeps the source link-layer address, Neighbor Advertisement the target one. A Router Advertisement also keeps up to four prefixes, up to four RDNSS addresses, the first DNSSL domain, and the MTU. Prefix L/A flags and lifetimes are not read. Other NDP options and MLDv2 records are not read. |
 | IGMP | v1 and v2 Query, Report, and Leave. v3 Query and Report, with at most 16 source addresses and 8 group records. |
 | ESP (protocol 50) | SPI and the payload length. Sequence, ciphertext, and ICV are not read. |
 
 These UDP labels are checked against the payload. A body that does not match drops the label and leaves plain UDP:
 
-- **DNS, mDNS, and LLMNR** (53, 5353, 5355). The first question name is kept, up to 64 characters, including compressed names. Answers may keep the first SRV record (port and target host). mDNS also keeps the `_service._proto` labels and the name from the first PTR record.
-- **DHCPv4** (67/68) must carry magic cookie `0x63825363`. Option 53 is the message type (Discover, Offer, Request, Decline, Ack, Nak, Release, Inform). Option 12 is the hostname (up to 64 characters). Option 50 is the requested IPv4, and only when it is exactly 4 bytes.
+- **DNS, mDNS, and LLMNR** (53, 5353, 5355). The first question name is kept, up to 64 characters, including compressed names. The first SRV record (port and target host) may be kept. Records are walked through the answer, authority, and additional sections; a truncated section stops the walk. mDNS also keeps the `_service._proto` labels, the name from the first PTR, the first A, the first AAAA, and the first TXT (character-strings joined with spaces, up to 128 characters). The address is the first one in the packet, not matched to the SRV host. DNS and LLMNR leave `service`, `ptr`, `a`, `aaaa`, and `txt` empty; if nothing remains, the message is not stored.
+- **DHCPv4** (67/68) must carry magic cookie `0x63825363`. Option 53 is the message type (Discover, Offer, Request, Decline, Ack, Nak, Release, Inform). Option 12 is the hostname and option 15 is the domain (up to 64 characters; a non-printable byte becomes `?`). Option 50 is the requested IPv4, and only when it is exactly 4 bytes. Option 3 is the first router, option 6 is up to four DNS addresses, option 54 is the server identifier, and option 51 is the lease time in seconds. A list whose length is not a multiple of 4 is skipped. `yiaddr` is not read.
 - **SSDP** (1900). The start line is `M-SEARCH`, `NOTIFY`, or `HTTP/1.x`. Headers kept: `NT`, `USN`, `LOCATION` (up to 128 characters).
-- **DHCPv6** (546/547). The message type is the first byte, types 1–13, when the message is long enough (at least 4 bytes, relay types 12–13 at least 34). Transaction id and options are not read.
+- **DHCPv6** (546/547). The message type is the first byte, types 1–13, when the message is long enough (at least 4 bytes, relay types 12–13 at least 34). A non-relay message also keeps the first IAADDR inside the first IA_NA and up to four DNS addresses (option 23). A relay message stays type-only. The transaction id is not read.
 - **NBNS** (137). The first label is 32 characters `A`–`P`. Kept: the name, suffix, NB or NBSTAT, and the opcode. A reply also keeps the result code and the IPv4 of the first complete NB record.
 
 Labels that stay on the port alone: NTP (123), QUIC (443), WireGuard (51820), ESP-over-UDP (4500).
@@ -63,7 +63,7 @@ On the LAN, when that traffic is present:
 
 Still unread inside messages that are already recognized:
 
-- Other NDP options on Router Advertisement, Neighbor Solicitation, and Neighbor Advertisement (prefixes, DNS). The neighbor MAC on NS and NA is already kept.
+- Other NDP options on Neighbor Solicitation and Neighbor Advertisement. Prefixes and DNS are not read there. Router Advertisement already keeps prefixes, RDNSS, the first DNSSL name, and the MTU. The neighbor MAC on NS and NA is already kept.
 - The ICMPv4 Router Advertisement address list.
 - MLDv2 Report records and their source lists. The `MldV2Report` variant is empty.
 - IGMP v3 source lists past 16 addresses, and group records past 8.
@@ -128,13 +128,28 @@ cargo build --release --bin net_visualizator
 
 `net_listener` needs the libpcap development package (see Prerequisites). The GUI binary only needs a normal Rust toolchain.
 
-### WASM (browser)
+### WASM
 
-The UI library uses `web-time`, so `Instant::now` will not panic on wasm32. There is no browser entry: no `eframe::WebRunner`, `index.html`, `Trunk.toml`, or WebSocket source.
+`net_listener` does not build for WASM: it needs libpcap and a raw socket.
+
+The visualizer **library** does. Time comes from `web-time`. The Unix datagram client, `libc`, and `tracing-subscriber` are left out of this target. The result is an `rlib`, not a page you can open.
+
+```bash
+rustup target add wasm32-unknown-unknown
+cargo build -p net_visualizator --lib --target wasm32-unknown-unknown
+```
+
+There is still no browser entry: no `eframe::WebRunner`, `index.html`, `Trunk.toml`, or WebSocket source. The `net_visualizator` binary stays native (`cargo build --bin net_visualizator`).
 
 ## Running
 
 ### Running net_listener
+
+The terminal report lists protocols, MAC addresses, ARP, IP addresses, and TCP connections. `f` opens the filter list. Space toggles a box and runs Select all or Clear all.
+
+![Terminal report](images/pic01.png)
+
+![Filter menu](images/pic02.png)
 
 **Important:** `net_listener` requires elevated privileges to capture packets.
 
